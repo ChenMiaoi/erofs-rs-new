@@ -106,6 +106,21 @@ erofs-cli inspect -i http://example.com/images/system.erofs ls /
 erofs-cli inspect -i http://example.com/images/system.erofs cat /etc/os-release
 ```
 
+### Pinned ABI field locator
+
+The `erofs-format` schema and locator are independent of the high-level reader.
+They expose stable field IDs, checked absolute spans, raw/decoded values,
+feature predicates, provenance, and structured failures for the M1 superblock,
+primary inode, and flat-directory subset.
+
+```bash
+erofs-cli field list --schema
+erofs-cli field locate image.erofs --object inode --space primary --nid 36 \
+  --field erofs.inode.compact.i_format --json
+erofs-cli field locate image.erofs --object dirent --nid 36 --block 0 --index 0 \
+  --field erofs.dirent.nameoff --mode tolerant --json
+```
+
 ## Status
 
 ### Implemented

@@ -294,6 +294,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "erofs-format",
  "erofs-rs",
  "memmap2",
  "opendal",
