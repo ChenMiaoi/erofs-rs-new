@@ -1,5 +1,5 @@
 [workspace]
-members = ["erofs-format", "erofs", "erofs-cli"]
+members = ["erofs-format", "erofs-lab", "erofs", "erofs-cli"]
 resolver = "2"
 
 [workspace.lints.clippy]
@@ -16,6 +16,9 @@ clap = { version = "4", default-features = false }
 memmap2 = { version = "0.9", default-features = false }
 opendal = { version = "0.55", default-features = false }
 rustix = { version = "1", default-features = false }
+serde = { version = "1", default-features = false }
+serde_json = { version = "1", default-features = false }
+sha2 = { version = "0.10", default-features = false }
 tar = { version = "0.4", default-features = false}
 thiserror = { version = "2", default-features = false }
 tokio = { version = "1", default-features = false }
