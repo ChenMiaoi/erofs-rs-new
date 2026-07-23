@@ -60,6 +60,48 @@ pub enum ObjectRef {
         block: String,
         index: u32,
     },
+    SuperblockExtension {
+        index: u8,
+    },
+    DeviceSlot {
+        index: u16,
+    },
+    Chunk {
+        inode: String,
+        index: String,
+    },
+    XattrHeader {
+        inode: String,
+    },
+    SharedXattrId {
+        inode: String,
+        index: u32,
+    },
+    InlineXattr {
+        inode: String,
+        index: u32,
+    },
+    XattrLongPrefix {
+        index: u8,
+    },
+    CompressionConfig {
+        algorithm: u8,
+    },
+    CompressionMap {
+        inode: String,
+    },
+    CompressionIndex {
+        inode: String,
+        index: String,
+    },
+    CompressionCompactPack {
+        inode: String,
+        index: String,
+    },
+    CompressionExtent {
+        inode: String,
+        index: String,
+    },
 }
 
 impl ObjectRef {
@@ -79,7 +121,53 @@ impl ObjectRef {
                 block: parse_u64(block)?,
                 index: *index,
             }),
-            Self::Inode { .. } => Err(Error::Unsupported("only primary inode space is supported")),
+            Self::SuperblockExtension { index } => {
+                Ok(FormatObjectRef::SuperblockExtension { index: *index })
+            }
+            Self::DeviceSlot { index } => Ok(FormatObjectRef::DeviceSlot { index: *index }),
+            Self::Chunk { inode, index } => Ok(FormatObjectRef::Chunk {
+                inode: parse_u64(inode)?,
+                index: parse_u64(index)?,
+            }),
+            Self::XattrHeader { inode } => Ok(FormatObjectRef::XattrHeader {
+                inode: parse_u64(inode)?,
+            }),
+            Self::SharedXattrId { inode, index } => Ok(FormatObjectRef::SharedXattrId {
+                inode: parse_u64(inode)?,
+                index: *index,
+            }),
+            Self::InlineXattr { inode, index } => Ok(FormatObjectRef::InlineXattr {
+                inode: parse_u64(inode)?,
+                index: *index,
+            }),
+            Self::XattrLongPrefix { index } => {
+                Ok(FormatObjectRef::XattrLongPrefix { index: *index })
+            }
+            Self::CompressionConfig { algorithm } => Ok(FormatObjectRef::CompressionConfig {
+                algorithm: *algorithm,
+            }),
+            Self::CompressionMap { inode } => Ok(FormatObjectRef::CompressionMap {
+                inode: parse_u64(inode)?,
+            }),
+            Self::CompressionIndex { inode, index } => Ok(FormatObjectRef::CompressionIndex {
+                inode: parse_u64(inode)?,
+                index: parse_u64(index)?,
+            }),
+            Self::CompressionCompactPack { inode, index } => {
+                Ok(FormatObjectRef::CompressionCompactPack {
+                    inode: parse_u64(inode)?,
+                    index: parse_u64(index)?,
+                })
+            }
+            Self::CompressionExtent { inode, index } => Ok(FormatObjectRef::CompressionExtent {
+                inode: parse_u64(inode)?,
+                index: parse_u64(index)?,
+            }),
+            Self::Inode { space, nid } if space == "metabox" => Ok(FormatObjectRef::Inode {
+                space: MetadataSpace::Metabox,
+                nid: parse_u64(nid)?,
+            }),
+            Self::Inode { .. } => Err(Error::Unsupported("unknown inode metadata space")),
         }
     }
 }
@@ -337,7 +425,7 @@ pub fn plan(
                 let occurrence = locator
                     .locate(object.to_format()?, definition)
                     .map_err(|error| Error::Resolve(format!("{error:?}")))?;
-                let bytes = encode(definition.encoding, definition.storage.len, *value)?;
+                let bytes = encode(definition.encoding, occurrence.span.len, *value)?;
                 add_write(
                     parent,
                     &mut writes,
@@ -361,12 +449,12 @@ pub fn plan(
             } => {
                 let definition = field_by_id(field)
                     .ok_or_else(|| Error::Resolve(format!("unknown field {field}")))?;
-                if bytes.len() as u64 != definition.storage.len {
-                    return Err(Error::Bounds);
-                }
                 let occurrence = locator
                     .locate(object.to_format()?, definition)
                     .map_err(|error| Error::Resolve(format!("{error:?}")))?;
+                if bytes.len() as u64 != occurrence.span.len {
+                    return Err(Error::Bounds);
+                }
                 add_write(
                     parent,
                     &mut writes,

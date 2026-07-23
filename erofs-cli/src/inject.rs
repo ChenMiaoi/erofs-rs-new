@@ -26,6 +26,18 @@ enum ObjectKind {
     Superblock,
     Inode,
     Dirent,
+    SuperblockExtension,
+    DeviceSlot,
+    Chunk,
+    XattrHeader,
+    SharedXattrId,
+    InlineXattr,
+    XattrLongPrefix,
+    CompressionConfig,
+    CompressionMap,
+    CompressionIndex,
+    CompressionCompactPack,
+    CompressionExtent,
 }
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Mode {
@@ -55,7 +67,7 @@ struct Common {
 struct ObjectArgs {
     #[arg(long, value_enum)]
     object: ObjectKind,
-    #[arg(long, default_value = "primary", value_parser = ["primary"])]
+    #[arg(long, default_value = "primary", value_parser = ["primary", "metabox"])]
     space: String,
     #[arg(long)]
     nid: Option<u64>,
@@ -63,6 +75,8 @@ struct ObjectArgs {
     block: u64,
     #[arg(long, default_value_t = 0)]
     index: u32,
+    #[arg(long, default_value_t = 0)]
+    algorithm: u8,
 }
 
 #[derive(Args, Debug)]
@@ -202,6 +216,69 @@ fn object_ref(args: ObjectArgs) -> Result<ObjectRef> {
                 .to_string(),
             block: args.block.to_string(),
             index: args.index,
+        }),
+        ObjectKind::SuperblockExtension => Ok(ObjectRef::SuperblockExtension {
+            index: u8::try_from(args.index).context("--index exceeds u8")?,
+        }),
+        ObjectKind::DeviceSlot => Ok(ObjectRef::DeviceSlot {
+            index: u16::try_from(args.index).context("--index exceeds u16")?,
+        }),
+        ObjectKind::Chunk => Ok(ObjectRef::Chunk {
+            inode: args.nid.context("--nid is required for chunk")?.to_string(),
+            index: args.index.to_string(),
+        }),
+        ObjectKind::XattrHeader => Ok(ObjectRef::XattrHeader {
+            inode: args
+                .nid
+                .context("--nid is required for xattr header")?
+                .to_string(),
+        }),
+        ObjectKind::SharedXattrId => Ok(ObjectRef::SharedXattrId {
+            inode: args
+                .nid
+                .context("--nid is required for shared xattr ID")?
+                .to_string(),
+            index: args.index,
+        }),
+        ObjectKind::InlineXattr => Ok(ObjectRef::InlineXattr {
+            inode: args
+                .nid
+                .context("--nid is required for inline xattr")?
+                .to_string(),
+            index: args.index,
+        }),
+        ObjectKind::XattrLongPrefix => Ok(ObjectRef::XattrLongPrefix {
+            index: u8::try_from(args.index).context("--index exceeds u8")?,
+        }),
+        ObjectKind::CompressionConfig => Ok(ObjectRef::CompressionConfig {
+            algorithm: args.algorithm,
+        }),
+        ObjectKind::CompressionMap => Ok(ObjectRef::CompressionMap {
+            inode: args
+                .nid
+                .context("--nid is required for compression map")?
+                .to_string(),
+        }),
+        ObjectKind::CompressionIndex => Ok(ObjectRef::CompressionIndex {
+            inode: args
+                .nid
+                .context("--nid is required for compression index")?
+                .to_string(),
+            index: args.index.to_string(),
+        }),
+        ObjectKind::CompressionCompactPack => Ok(ObjectRef::CompressionCompactPack {
+            inode: args
+                .nid
+                .context("--nid is required for compact pack")?
+                .to_string(),
+            index: args.index.to_string(),
+        }),
+        ObjectKind::CompressionExtent => Ok(ObjectRef::CompressionExtent {
+            inode: args
+                .nid
+                .context("--nid is required for extent")?
+                .to_string(),
+            index: args.index.to_string(),
         }),
     }
 }

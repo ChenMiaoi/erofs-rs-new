@@ -39,6 +39,18 @@ enum ObjectKind {
     Superblock,
     Inode,
     Dirent,
+    SuperblockExtension,
+    DeviceSlot,
+    Chunk,
+    XattrHeader,
+    SharedXattrId,
+    InlineXattr,
+    XattrLongPrefix,
+    CompressionConfig,
+    CompressionMap,
+    CompressionIndex,
+    CompressionCompactPack,
+    CompressionExtent,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -57,8 +69,8 @@ struct LocateArgs {
     /// Stable field ID, such as `erofs.inode.compact.i_format`.
     #[arg(long)]
     field: String,
-    /// Metadata space; M1 supports only `primary`.
-    #[arg(long, default_value = "primary", value_parser = ["primary"])]
+    /// Metadata space for inode objects.
+    #[arg(long, default_value = "primary", value_parser = ["primary", "metabox"])]
     space: String,
     /// Primary inode NID, or directory inode NID for a dirent.
     #[arg(long)]
@@ -69,6 +81,9 @@ struct LocateArgs {
     /// Dirent index within the directory block.
     #[arg(long, default_value_t = 0)]
     index: u32,
+    /// Compression algorithm ID or other object-specific selector.
+    #[arg(long, default_value_t = 0)]
+    algorithm: u8,
     /// Parent-structure validation policy.
     #[arg(long, value_enum, default_value_t = Mode::Strict)]
     mode: Mode,
@@ -134,7 +149,11 @@ fn locate(args: LocateArgs) -> Result<()> {
         Mode::Tolerant => ParseMode::Tolerant,
     };
     let locator = Locator::with_mode(&reader, mode).map_err(format_locator_error)?;
-    let _ = &args.space;
+    let space = if args.space == "metabox" {
+        MetadataSpace::Metabox
+    } else {
+        MetadataSpace::Primary
+    };
     let field =
         field_by_id(&args.field).ok_or_else(|| anyhow!("unknown field ID: {}", args.field))?;
     let object = match args.object {
@@ -145,13 +164,57 @@ fn locate(args: LocateArgs) -> Result<()> {
             ObjectRef::Superblock
         }
         ObjectKind::Inode => ObjectRef::Inode {
-            space: MetadataSpace::Primary,
+            space,
             nid: args.nid.context("--nid is required for an inode object")?,
         },
         ObjectKind::Dirent => ObjectRef::Dirent {
             directory: args.nid.context("--nid is required for a dirent object")?,
             block: args.block,
             index: args.index,
+        },
+        ObjectKind::SuperblockExtension => ObjectRef::SuperblockExtension {
+            index: u8::try_from(args.index).context("--index exceeds u8")?,
+        },
+        ObjectKind::DeviceSlot => ObjectRef::DeviceSlot {
+            index: u16::try_from(args.index).context("--index exceeds u16")?,
+        },
+        ObjectKind::Chunk => ObjectRef::Chunk {
+            inode: args.nid.context("--nid is required for chunk")?,
+            index: u64::from(args.index),
+        },
+        ObjectKind::XattrHeader => ObjectRef::XattrHeader {
+            inode: args.nid.context("--nid is required for xattr header")?,
+        },
+        ObjectKind::SharedXattrId => ObjectRef::SharedXattrId {
+            inode: args.nid.context("--nid is required for shared xattr ID")?,
+            index: args.index,
+        },
+        ObjectKind::InlineXattr => ObjectRef::InlineXattr {
+            inode: args.nid.context("--nid is required for inline xattr")?,
+            index: args.index,
+        },
+        ObjectKind::XattrLongPrefix => ObjectRef::XattrLongPrefix {
+            index: u8::try_from(args.index).context("--index exceeds u8")?,
+        },
+        ObjectKind::CompressionConfig => ObjectRef::CompressionConfig {
+            algorithm: args.algorithm,
+        },
+        ObjectKind::CompressionMap => ObjectRef::CompressionMap {
+            inode: args.nid.context("--nid is required for compression map")?,
+        },
+        ObjectKind::CompressionIndex => ObjectRef::CompressionIndex {
+            inode: args
+                .nid
+                .context("--nid is required for compression index")?,
+            index: u64::from(args.index),
+        },
+        ObjectKind::CompressionCompactPack => ObjectRef::CompressionCompactPack {
+            inode: args.nid.context("--nid is required for compact pack")?,
+            index: u64::from(args.index),
+        },
+        ObjectKind::CompressionExtent => ObjectRef::CompressionExtent {
+            inode: args.nid.context("--nid is required for extent")?,
+            index: u64::from(args.index),
         },
     };
     let occurrence = locator
@@ -211,6 +274,42 @@ fn object_json(object: ObjectRef) -> String {
         } => format!(
             "{{\"kind\":\"dirent\",\"directory\":{{\"space\":\"primary\",\"nid\":\"{directory}\"}},\"block\":\"{block}\",\"index\":{index}}}"
         ),
+        ObjectRef::SuperblockExtension { index } => {
+            format!("{{\"kind\":\"superblock_extension\",\"index\":{index}}}")
+        }
+        ObjectRef::DeviceSlot { index } => {
+            format!("{{\"kind\":\"device_slot\",\"index\":{index}}}")
+        }
+        ObjectRef::Chunk { inode, index } => {
+            format!("{{\"kind\":\"chunk\",\"inode\":\"{inode}\",\"index\":\"{index}\"}}")
+        }
+        ObjectRef::XattrHeader { inode } => {
+            format!("{{\"kind\":\"xattr_header\",\"inode\":\"{inode}\"}}")
+        }
+        ObjectRef::SharedXattrId { inode, index } => {
+            format!("{{\"kind\":\"shared_xattr_id\",\"inode\":\"{inode}\",\"index\":{index}}}")
+        }
+        ObjectRef::InlineXattr { inode, index } => {
+            format!("{{\"kind\":\"inline_xattr\",\"inode\":\"{inode}\",\"index\":{index}}}")
+        }
+        ObjectRef::XattrLongPrefix { index } => {
+            format!("{{\"kind\":\"xattr_long_prefix\",\"index\":{index}}}")
+        }
+        ObjectRef::CompressionConfig { algorithm } => {
+            format!("{{\"kind\":\"compression_config\",\"algorithm\":{algorithm}}}")
+        }
+        ObjectRef::CompressionMap { inode } => {
+            format!("{{\"kind\":\"compression_map\",\"inode\":\"{inode}\"}}")
+        }
+        ObjectRef::CompressionIndex { inode, index } => format!(
+            "{{\"kind\":\"compression_index\",\"inode\":\"{inode}\",\"index\":\"{index}\"}}"
+        ),
+        ObjectRef::CompressionCompactPack { inode, index } => format!(
+            "{{\"kind\":\"compression_compact_pack\",\"inode\":\"{inode}\",\"index\":\"{index}\"}}"
+        ),
+        ObjectRef::CompressionExtent { inode, index } => format!(
+            "{{\"kind\":\"compression_extent\",\"inode\":\"{inode}\",\"index\":\"{index}\"}}"
+        ),
     }
 }
 
@@ -224,6 +323,28 @@ fn object_name(object: ObjectRef) -> String {
             index,
         } => {
             format!("dirent(directory={directory},block={block},index={index})")
+        }
+        ObjectRef::SuperblockExtension { index } => format!("superblock-extension({index})"),
+        ObjectRef::DeviceSlot { index } => format!("device-slot({index})"),
+        ObjectRef::Chunk { inode, index } => format!("chunk(inode={inode},index={index})"),
+        ObjectRef::XattrHeader { inode } => format!("xattr-header(inode={inode})"),
+        ObjectRef::SharedXattrId { inode, index } => {
+            format!("shared-xattr-id(inode={inode},index={index})")
+        }
+        ObjectRef::InlineXattr { inode, index } => {
+            format!("inline-xattr(inode={inode},index={index})")
+        }
+        ObjectRef::XattrLongPrefix { index } => format!("xattr-long-prefix({index})"),
+        ObjectRef::CompressionConfig { algorithm } => format!("compression-config({algorithm})"),
+        ObjectRef::CompressionMap { inode } => format!("compression-map(inode={inode})"),
+        ObjectRef::CompressionIndex { inode, index } => {
+            format!("compression-index(inode={inode},index={index})")
+        }
+        ObjectRef::CompressionCompactPack { inode, index } => {
+            format!("compression-compact-pack(inode={inode},index={index})")
+        }
+        ObjectRef::CompressionExtent { inode, index } => {
+            format!("compression-extent(inode={inode},index={index})")
         }
     }
 }
@@ -267,6 +388,18 @@ fn structure_name(value: StructureId) -> &'static str {
         StructureId::CompactInode => "compact_inode",
         StructureId::ExtendedInode => "extended_inode",
         StructureId::Dirent => "dirent",
+        StructureId::SuperblockExtension => "superblock_extension",
+        StructureId::DeviceSlot => "device_slot",
+        StructureId::ChunkEntry => "chunk_entry",
+        StructureId::XattrHeader => "xattr_header",
+        StructureId::SharedXattrId => "shared_xattr_id",
+        StructureId::XattrEntry => "xattr_entry",
+        StructureId::XattrLongPrefix => "xattr_long_prefix",
+        StructureId::CompressionConfig => "compression_config",
+        StructureId::CompressionMap => "compression_map",
+        StructureId::CompressionIndex => "compression_index",
+        StructureId::CompressionCompactPack => "compression_compact_pack",
+        StructureId::CompressionExtent => "compression_extent",
     }
 }
 
@@ -288,6 +421,10 @@ fn predicate_name(value: Predicate) -> &'static str {
         Predicate::WithoutCompressionConfig => "without-compression-config",
         Predicate::WithCompressionConfig => "with-compression-config",
         Predicate::Superblock144 => "superblock-size-at-least-144",
+        Predicate::WithMetabox => "with-metabox",
+        Predicate::WithXattrPrefixes => "with-xattr-prefixes",
+        Predicate::WithDeviceTable => "with-device-table",
+        Predicate::Dynamic => "dynamic",
     }
 }
 
