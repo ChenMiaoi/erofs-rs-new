@@ -20,21 +20,6 @@ static void mkdir_p(const char *path, mode_t mode)
 	}
 }
 
-static void write_file(const char *path, const char *text)
-{
-	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-	ssize_t written;
-
-	if (fd < 0) {
-		perror(path);
-		return;
-	}
-	written = write(fd, text, strlen(text));
-	if (written < 0) {
-		perror(path);
-	}
-	close(fd);
-}
 
 static void show_file(const char *path)
 {
@@ -56,46 +41,6 @@ static void show_file(const char *path)
 	close(fd);
 }
 
-static void list_files(const char *path, int depth)
-{
-	DIR *dir;
-	struct dirent *entry;
-
-	if (depth < 0) {
-		return;
-	}
-
-	dir = opendir(path);
-	if (!dir) {
-		perror(path);
-		return;
-	}
-
-	while ((entry = readdir(dir)) != NULL) {
-		char child[512];
-		struct stat st;
-
-		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-			continue;
-		}
-		snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
-		if (stat(child, &st) < 0) {
-			perror(child);
-			continue;
-		}
-		if (S_ISDIR(st.st_mode)) {
-			list_files(child, depth - 1);
-		} else if (S_ISREG(st.st_mode)) {
-			puts(child);
-		} else if (S_ISLNK(st.st_mode)) {
-			printf("%s -> (symlink)\n", child);
-		} else {
-			printf("%s -> (special: mode=%o)\n", child, st.st_mode);
-		}
-	}
-
-	closedir(dir);
-}
 
 struct traversal_stats {
 	unsigned long nodes;
@@ -105,12 +50,21 @@ struct traversal_stats {
 	int failed;
 };
 
-static void traverse_all(const char *path, struct traversal_stats *stats)
+#define ORACLE_MAX_NODES 100000UL
+#define ORACLE_MAX_DEPTH 256U
+#define ORACLE_MAX_BYTES (1ULL << 30)
+
+static void traverse_all(const char *path, struct traversal_stats *stats, unsigned int depth)
 {
 	DIR *dir;
 	struct dirent *entry;
 	char child[512];
 	struct stat st;
+	if (depth > ORACLE_MAX_DEPTH) {
+		puts("EROFS_ORACLE phase=traverse status=resource_exhausted reason=depth_limit");
+		stats->failed = 1;
+		return;
+	}
 
 	dir = opendir(path);
 	if (!dir) {
@@ -140,9 +94,14 @@ static void traverse_all(const char *path, struct traversal_stats *stats)
 			continue;
 		}
 		stats->nodes++;
+		if (stats->nodes > ORACLE_MAX_NODES) {
+			puts("EROFS_ORACLE phase=traverse status=resource_exhausted reason=node_limit");
+			stats->failed = 1;
+			break;
+		}
 
 		if (S_ISDIR(st.st_mode)) {
-			traverse_all(child, stats);
+			traverse_all(child, stats, depth + 1);
 		} else if (S_ISREG(st.st_mode)) {
 			char buf[4096];
 			ssize_t n;
@@ -155,8 +114,14 @@ static void traverse_all(const char *path, struct traversal_stats *stats)
 				continue;
 			}
 			stats->regular_files++;
-			while ((n = read(fd, buf, sizeof(buf))) > 0)
+			while ((n = read(fd, buf, sizeof(buf))) > 0) {
 				stats->bytes_read += (unsigned long long)n;
+				if (stats->bytes_read > ORACLE_MAX_BYTES) {
+					puts("EROFS_ORACLE phase=read_data status=resource_exhausted reason=byte_limit");
+					stats->failed = 1;
+					break;
+				}
+			}
 			if (n < 0) {
 				printf("EROFS_ORACLE phase=read_data status=rejected path=%s errno=%d\n",
 				       child, errno);
@@ -233,7 +198,7 @@ int main(void)
 	}
 
 	puts("EROFS_ORACLE phase=mount status=accepted");
-	traverse_all("/mnt/erofs", &stats);
+	traverse_all("/mnt/erofs", &stats, 0);
 	printf("EROFS_ORACLE phase=traverse status=%s nodes=%lu regular_files=%lu symlinks=%lu bytes_read=%llu\n",
 	       stats.failed ? "rejected" : "accepted", stats.nodes,
 	       stats.regular_files, stats.symlinks, stats.bytes_read);

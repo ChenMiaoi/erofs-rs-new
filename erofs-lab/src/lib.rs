@@ -1,6 +1,7 @@
 //! Deterministic EROFS mutation planning, materialization, and byte replay.
 
 #![forbid(unsafe_code)]
+pub mod oracle;
 
 use std::{
     collections::BTreeMap,

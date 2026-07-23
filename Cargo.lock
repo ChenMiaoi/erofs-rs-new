@@ -323,6 +323,7 @@ name = "erofs-lab"
 version = "0.1.0"
 dependencies = [
  "erofs-format",
+ "erofs-rs",
  "rustix",
  "serde",
  "serde_json",

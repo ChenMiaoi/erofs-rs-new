@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 erofs-format = { path = "../erofs-format" }
 rustix = { workspace = true, default-features = true, features = ["fs"] }
+erofs-rs = { path = "../erofs" }
 serde = { workspace = true, default-features = true, features = ["derive"] }
 serde_json = { workspace = true, default-features = true }
 sha2 = { workspace = true, default-features = true }
