@@ -1,6 +1,7 @@
 //! Deterministic EROFS mutation planning, materialization, and byte replay.
 
 #![forbid(unsafe_code)]
+pub mod campaign;
 pub mod oracle;
 
 use std::{
@@ -556,6 +557,16 @@ fn apply_integrity(
         status: "applied".into(),
     });
     Ok(())
+}
+/// Applies a frozen plan in memory after validating every preimage.
+///
+/// Campaigns use this to deduplicate byte identities before publishing a
+/// second semantic plan for identical output bytes.
+pub fn apply_resolved_plan(parent: &[u8], plan: &ResolvedPlan) -> Result<Vec<u8>, Error> {
+    if parent.len() as u64 != plan.parent_length || sha256(parent) != plan.parent_sha256 {
+        return Err(Error::ParentIdentity);
+    }
+    apply_plan_bytes(parent, &plan.patches, plan.resize.as_ref())
 }
 
 /// Materializes and atomically publishes a plan under `samples/sha256/<hash>`.

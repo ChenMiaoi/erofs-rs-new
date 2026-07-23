@@ -16,6 +16,8 @@ clap = { version = "4", default-features = false }
 memmap2 = { version = "0.9", default-features = false }
 opendal = { version = "0.55", default-features = false }
 rustix = { version = "1", default-features = false }
+rand_chacha = { version = "0.9", default-features = false }
+rand_core = { version = "0.9", default-features = false }
 serde = { version = "1", default-features = false }
 serde_json = { version = "1", default-features = false }
 sha2 = { version = "0.10", default-features = false }
