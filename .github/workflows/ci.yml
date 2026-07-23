@@ -9,6 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: true
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -17,6 +19,8 @@ jobs:
 
       - run: cargo fmt --all --check
       - run: cargo check -p erofs-format --no-default-features --locked
+      - run: cc -std=c11 -Wall -Wextra -Werror -o /tmp/erofs-layout-probe scripts/erofs-layout-probe.c
+      - run: /tmp/erofs-layout-probe
       - run: cargo build --workspace --all-targets --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked

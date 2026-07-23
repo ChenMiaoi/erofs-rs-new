@@ -8,6 +8,8 @@
 #![forbid(unsafe_code)]
 
 use core::fmt;
+pub mod locator;
+pub mod schema;
 
 /// EROFS superblock magic in host byte order.
 pub const SUPERBLOCK_MAGIC: u32 = 0xe0f5_e1e2;
