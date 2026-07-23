@@ -145,6 +145,28 @@ erofs-cli replay corpus/samples/sha256/HASH/sample.json \
   --parent image.erofs --output-dir replayed-corpus
 ```
 
+### Independent oracle profiles
+
+M3 runs each oracle in a separate process under a user and network namespace,
+with CPU, address-space, file-size, process-count, wall-time, and log limits.
+Results are immutable records under `runs/<sample-sha256>/<profile>/` and never
+modify `sample.json`.
+
+```bash
+erofs-cli oracle run corpus/samples/sha256/HASH/sample.json \
+  --profile rust-full
+erofs-cli oracle run corpus/samples/sha256/HASH/sample.json \
+  --profile fsck-full
+erofs-cli oracle run corpus/samples/sha256/HASH/sample.json \
+  --profile fsck-no-sbcrc
+erofs-cli oracle run corpus/samples/sha256/HASH/sample.json \
+  --profile linux-kasan --timeout-ms 80000
+```
+
+Profiles record complete argv, fixed environment, resource limits, binary and
+kernel/config/initramfs hashes, exit status, signal, wall time, bounded logs,
+classifier rule, phase, status, and stable signature.
+
 ## Status
 
 ### Implemented

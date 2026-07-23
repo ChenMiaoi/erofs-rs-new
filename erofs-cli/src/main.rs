@@ -6,6 +6,7 @@ mod dump;
 mod field;
 mod inject;
 mod inspect;
+mod oracle;
 mod replay;
 
 #[derive(Subcommand, Debug)]
@@ -15,6 +16,7 @@ enum Commands {
     Inject(inject::InjectArgs),
     Inspect(inspect::InspectArgs),
     Convert(convert::ConvertArgs),
+    Oracle(oracle::OracleArgs),
     Replay(replay::ReplayArgs),
 }
 
@@ -34,6 +36,7 @@ async fn main() -> Result<()> {
         Commands::Inject(args) => inject::inject(args),
         Commands::Inspect(args) => inspect::inspect(args).await,
         Commands::Convert(args) => convert::convert(args),
+        Commands::Oracle(args) => oracle::oracle(args),
         Commands::Replay(args) => replay::replay_sample(args),
     }
 }
