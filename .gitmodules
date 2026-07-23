@@ -1,0 +1,6 @@
+[submodule "vendor/linux"]
+	path = vendor/linux
+	url = https://github.com/torvalds/linux.git
+[submodule "vendor/erofs-utils"]
+	path = vendor/erofs-utils
+	url = https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git
