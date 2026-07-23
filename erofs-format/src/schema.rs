@@ -10,7 +10,7 @@ pub const SCHEMA_API: &str = "erofs-abi-schema/v1";
 pub const SOURCE_HEADER: &str = "fs/erofs/erofs_fs.h";
 /// SHA-256 of the canonical schema identity tuple (`api`, commit, header).
 pub const SCHEMA_DIGEST: &str =
-    "sha256:ad535d233291854d30a260a9abbf78531c0e2dc4932bda6c3ccefe0374b6ad23";
+    "sha256:9ac9ea849d004293196a0e5ddd46b4defe49251207d991ff7312bbf13ae10efa";
 
 /// Identity of the compiled ABI schema.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +44,30 @@ pub enum StructureId {
     ExtendedInode,
     /// `struct erofs_dirent`.
     Dirent,
+    /// Raw superblock extension slot.
+    SuperblockExtension,
+    /// `struct erofs_deviceslot`.
+    DeviceSlot,
+    /// `struct erofs_inode_chunk_index` or a 4-byte block entry.
+    ChunkEntry,
+    /// `struct erofs_xattr_ibody_header`.
+    XattrHeader,
+    /// Shared xattr ID in an inline xattr header.
+    SharedXattrId,
+    /// `struct erofs_xattr_entry` and its bounded payload.
+    XattrEntry,
+    /// Generic long-prefix metadata record.
+    XattrLongPrefix,
+    /// Generic compression configuration metadata record.
+    CompressionConfig,
+    /// `struct z_erofs_map_header`.
+    CompressionMap,
+    /// `struct z_erofs_lcluster_index`.
+    CompressionIndex,
+    /// One compact lcluster index pack.
+    CompressionCompactPack,
+    /// One variable-width `struct z_erofs_extent` record.
+    CompressionExtent,
 }
 
 /// Scalar or byte-array encoding.
@@ -76,6 +100,14 @@ pub enum Predicate {
     WithCompressionConfig,
     /// Field requires a superblock region of at least 144 bytes.
     Superblock144,
+    /// Field is present when `EROFS_FEATURE_INCOMPAT_METABOX` is set.
+    WithMetabox,
+    /// Field is present when `EROFS_FEATURE_INCOMPAT_XATTR_PREFIXES` is set.
+    WithXattrPrefixes,
+    /// Field is present when `EROFS_FEATURE_INCOMPAT_DEVICE_TABLE` is set.
+    WithDeviceTable,
+    /// Field length and, for payloads, offset are resolved from the object.
+    Dynamic,
 }
 
 /// Static definition of one stable schema field.
@@ -111,7 +143,7 @@ macro_rules! field {
     };
 }
 
-/// All fields supported by the M1 locator.
+/// All fields supported by the M5 locator.
 pub static FIELDS: &[FieldDef] = &[
     field!(
         "erofs.superblock.magic",
@@ -653,6 +685,402 @@ pub static FIELDS: &[FieldDef] = &[
         Always,
         "erofs_dirent.reserved"
     ),
+    field!(
+        "erofs.super.extension.raw",
+        SuperblockExtension,
+        0,
+        16,
+        Bytes,
+        Dynamic,
+        "erofs_super_block extension slot"
+    ),
+    field!(
+        "erofs.device.tag",
+        DeviceSlot,
+        0,
+        64,
+        Bytes,
+        WithDeviceTable,
+        "erofs_deviceslot.tag"
+    ),
+    field!(
+        "erofs.device.blocks_lo",
+        DeviceSlot,
+        64,
+        4,
+        LeU32,
+        WithDeviceTable,
+        "erofs_deviceslot.blocks_lo"
+    ),
+    field!(
+        "erofs.device.uniaddr_lo",
+        DeviceSlot,
+        68,
+        4,
+        LeU32,
+        WithDeviceTable,
+        "erofs_deviceslot.uniaddr_lo"
+    ),
+    field!(
+        "erofs.device.blocks_hi",
+        DeviceSlot,
+        72,
+        2,
+        LeU16,
+        With48Bit,
+        "erofs_deviceslot.blocks_hi"
+    ),
+    field!(
+        "erofs.device.uniaddr_hi",
+        DeviceSlot,
+        74,
+        2,
+        LeU16,
+        With48Bit,
+        "erofs_deviceslot.uniaddr_hi"
+    ),
+    field!(
+        "erofs.device.reserved",
+        DeviceSlot,
+        76,
+        52,
+        Bytes,
+        WithDeviceTable,
+        "erofs_deviceslot.reserved"
+    ),
+    field!(
+        "erofs.chunk.block",
+        ChunkEntry,
+        0,
+        4,
+        LeU32,
+        Dynamic,
+        "__le32 chunk block address"
+    ),
+    field!(
+        "erofs.chunk.startblk_hi",
+        ChunkEntry,
+        0,
+        2,
+        LeU16,
+        Dynamic,
+        "erofs_inode_chunk_index.startblk_hi"
+    ),
+    field!(
+        "erofs.chunk.device_id",
+        ChunkEntry,
+        2,
+        2,
+        LeU16,
+        Dynamic,
+        "erofs_inode_chunk_index.device_id"
+    ),
+    field!(
+        "erofs.chunk.startblk_lo",
+        ChunkEntry,
+        4,
+        4,
+        LeU32,
+        Dynamic,
+        "erofs_inode_chunk_index.startblk_lo"
+    ),
+    field!(
+        "erofs.xattr.header.name_filter",
+        XattrHeader,
+        0,
+        4,
+        LeU32,
+        Dynamic,
+        "erofs_xattr_ibody_header.h_name_filter"
+    ),
+    field!(
+        "erofs.xattr.header.shared_count",
+        XattrHeader,
+        4,
+        1,
+        U8,
+        Dynamic,
+        "erofs_xattr_ibody_header.h_shared_count"
+    ),
+    field!(
+        "erofs.xattr.header.reserved",
+        XattrHeader,
+        5,
+        7,
+        Bytes,
+        Dynamic,
+        "erofs_xattr_ibody_header.h_reserved2"
+    ),
+    field!(
+        "erofs.xattr.shared_id",
+        SharedXattrId,
+        0,
+        4,
+        LeU32,
+        Dynamic,
+        "erofs_xattr_ibody_header.h_shared_xattrs[]"
+    ),
+    field!(
+        "erofs.xattr.entry.name_len",
+        XattrEntry,
+        0,
+        1,
+        U8,
+        Dynamic,
+        "erofs_xattr_entry.e_name_len"
+    ),
+    field!(
+        "erofs.xattr.entry.name_index",
+        XattrEntry,
+        1,
+        1,
+        U8,
+        Dynamic,
+        "erofs_xattr_entry.e_name_index"
+    ),
+    field!(
+        "erofs.xattr.entry.value_size",
+        XattrEntry,
+        2,
+        2,
+        LeU16,
+        Dynamic,
+        "erofs_xattr_entry.e_value_size"
+    ),
+    field!(
+        "erofs.xattr.entry.name",
+        XattrEntry,
+        4,
+        0,
+        Bytes,
+        Dynamic,
+        "erofs_xattr_entry.e_name"
+    ),
+    field!(
+        "erofs.xattr.entry.value",
+        XattrEntry,
+        4,
+        0,
+        Bytes,
+        Dynamic,
+        "erofs_xattr_entry value"
+    ),
+    field!(
+        "erofs.xattr.prefix.length",
+        XattrLongPrefix,
+        0,
+        2,
+        LeU16,
+        WithXattrPrefixes,
+        "metadata record length"
+    ),
+    field!(
+        "erofs.xattr.prefix.base_index",
+        XattrLongPrefix,
+        2,
+        1,
+        U8,
+        WithXattrPrefixes,
+        "erofs_xattr_long_prefix.base_index"
+    ),
+    field!(
+        "erofs.xattr.prefix.infix",
+        XattrLongPrefix,
+        3,
+        0,
+        Bytes,
+        Dynamic,
+        "erofs_xattr_long_prefix.infix"
+    ),
+    field!(
+        "erofs.compression.config.length",
+        CompressionConfig,
+        0,
+        2,
+        LeU16,
+        WithCompressionConfig,
+        "metadata record length"
+    ),
+    field!(
+        "erofs.compression.config.payload",
+        CompressionConfig,
+        2,
+        0,
+        Bytes,
+        Dynamic,
+        "compression configuration payload"
+    ),
+    field!(
+        "erofs.compression.map.fragmentoff",
+        CompressionMap,
+        0,
+        4,
+        LeU32,
+        Dynamic,
+        "z_erofs_map_header.h_fragmentoff"
+    ),
+    field!(
+        "erofs.compression.map.idata_size",
+        CompressionMap,
+        2,
+        2,
+        LeU16,
+        Dynamic,
+        "z_erofs_map_header.h_idata_size"
+    ),
+    field!(
+        "erofs.compression.map.extents_lo",
+        CompressionMap,
+        0,
+        4,
+        LeU32,
+        Dynamic,
+        "z_erofs_map_header.h_extents_lo"
+    ),
+    field!(
+        "erofs.compression.map.advise",
+        CompressionMap,
+        4,
+        2,
+        LeU16,
+        Dynamic,
+        "z_erofs_map_header.h_advise"
+    ),
+    field!(
+        "erofs.compression.map.algorithmtype",
+        CompressionMap,
+        6,
+        1,
+        U8,
+        Dynamic,
+        "z_erofs_map_header.h_algorithmtype"
+    ),
+    field!(
+        "erofs.compression.map.clusterbits",
+        CompressionMap,
+        7,
+        1,
+        U8,
+        Dynamic,
+        "z_erofs_map_header.h_clusterbits"
+    ),
+    field!(
+        "erofs.compression.map.extents_hi",
+        CompressionMap,
+        6,
+        2,
+        LeU16,
+        Dynamic,
+        "z_erofs_map_header.h_extents_hi"
+    ),
+    field!(
+        "erofs.compression.index.advise",
+        CompressionIndex,
+        0,
+        2,
+        LeU16,
+        Dynamic,
+        "z_erofs_lcluster_index.di_advise"
+    ),
+    field!(
+        "erofs.compression.index.clusterofs",
+        CompressionIndex,
+        2,
+        2,
+        LeU16,
+        Dynamic,
+        "z_erofs_lcluster_index.di_clusterofs"
+    ),
+    field!(
+        "erofs.compression.index.blkaddr",
+        CompressionIndex,
+        4,
+        4,
+        LeU32,
+        Dynamic,
+        "z_erofs_lcluster_index.di_u.blkaddr"
+    ),
+    field!(
+        "erofs.compression.index.delta0",
+        CompressionIndex,
+        4,
+        2,
+        LeU16,
+        Dynamic,
+        "z_erofs_lcluster_index.di_u.delta[0]"
+    ),
+    field!(
+        "erofs.compression.index.delta1",
+        CompressionIndex,
+        6,
+        2,
+        LeU16,
+        Dynamic,
+        "z_erofs_lcluster_index.di_u.delta[1]"
+    ),
+    field!(
+        "erofs.compression.compact_pack.raw",
+        CompressionCompactPack,
+        0,
+        0,
+        Bytes,
+        Dynamic,
+        "compact lcluster index pack"
+    ),
+    field!(
+        "erofs.compression.extent.plen",
+        CompressionExtent,
+        0,
+        4,
+        LeU32,
+        Dynamic,
+        "z_erofs_extent.plen"
+    ),
+    field!(
+        "erofs.compression.extent.pstart_lo",
+        CompressionExtent,
+        4,
+        4,
+        LeU32,
+        Dynamic,
+        "z_erofs_extent.pstart_lo"
+    ),
+    field!(
+        "erofs.compression.extent.pstart_hi",
+        CompressionExtent,
+        8,
+        4,
+        LeU32,
+        Dynamic,
+        "z_erofs_extent.pstart_hi"
+    ),
+    field!(
+        "erofs.compression.extent.lstart_lo",
+        CompressionExtent,
+        12,
+        4,
+        LeU32,
+        Dynamic,
+        "z_erofs_extent.lstart_lo"
+    ),
+    field!(
+        "erofs.compression.extent.lstart_hi",
+        CompressionExtent,
+        16,
+        4,
+        LeU32,
+        Dynamic,
+        "z_erofs_extent.lstart_hi"
+    ),
+    field!(
+        "erofs.compression.extent.reserved",
+        CompressionExtent,
+        20,
+        12,
+        Bytes,
+        Dynamic,
+        "z_erofs_extent.reserved"
+    ),
 ];
 
 /// Looks up a field by stable ID.
@@ -679,9 +1107,21 @@ mod tests {
                 StructureId::CompactInode => 32,
                 StructureId::ExtendedInode => 64,
                 StructureId::Dirent => 12,
+                StructureId::SuperblockExtension => 16,
+                StructureId::DeviceSlot => 128,
+                StructureId::ChunkEntry
+                | StructureId::CompressionMap
+                | StructureId::CompressionIndex => 8,
+                StructureId::XattrHeader => 12,
+                StructureId::SharedXattrId => 4,
+                StructureId::XattrEntry
+                | StructureId::XattrLongPrefix
+                | StructureId::CompressionConfig
+                | StructureId::CompressionCompactPack
+                | StructureId::CompressionExtent => 64,
             };
             assert!(field.storage.end().unwrap() <= size, "{}", field.id);
-            assert!(field.storage.len <= 16, "{}", field.id);
+            assert!(field.storage.len <= 64, "{}", field.id);
             assert_eq!(field_by_id(field.id), Some(field));
         }
     }

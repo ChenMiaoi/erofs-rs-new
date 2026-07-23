@@ -2,18 +2,27 @@
 
 use crate::schema::{Encoding, FieldDef, Predicate, StructureId};
 use crate::{
-    ReadAt, SUPERBLOCK_BASE_SIZE, SUPERBLOCK_EXTSLOT_SIZE, SUPERBLOCK_OFFSET, Span, le_u16, le_u32,
-    le_u64, primary_inode_offset,
+    CHUNK_FORMAT_ALL, CHUNK_FORMAT_INDEXES, ReadAt, SUPERBLOCK_BASE_SIZE, SUPERBLOCK_EXTSLOT_SIZE,
+    SUPERBLOCK_OFFSET, Span, le_u16, le_u32, le_u64, primary_inode_offset,
 };
 
 const FEATURE_INCOMPAT_COMPR_CFGS: u32 = 0x0000_0002;
 const FEATURE_INCOMPAT_48BIT: u32 = 0x0000_0080;
+const FEATURE_INCOMPAT_DEVICE_TABLE: u32 = 0x0000_0008;
+const FEATURE_INCOMPAT_XATTR_PREFIXES: u32 = 0x0000_0040;
+const FEATURE_INCOMPAT_METABOX: u32 = 0x0000_0100;
 const INODE_EXTENDED_BIT: u16 = 0x0001;
 const INODE_LAYOUT_MASK: u16 = 0x000e;
 const INODE_LAYOUT_SHIFT: u32 = 1;
 const LAYOUT_FLAT_PLAIN: u16 = 0;
 const LAYOUT_FLAT_INLINE: u16 = 2;
 const COMPACT_INODE_SIZE: u64 = 32;
+const LAYOUT_COMPRESSED_FULL: u16 = 1;
+const LAYOUT_COMPRESSED_COMPACT: u16 = 3;
+const LAYOUT_CHUNK: u16 = 4;
+const XATTR_HEADER_SIZE: u64 = 12;
+const DEVICE_SLOT_SIZE: u64 = 128;
+const ADVISE_EXTENTS: u16 = 1;
 const EXTENDED_INODE_SIZE: u64 = 64;
 const DIRENT_SIZE: u64 = 12;
 const MODE_DIRECTORY: u16 = 0o040000;
@@ -34,6 +43,8 @@ pub enum ParseMode {
 pub enum MetadataSpace {
     /// Primary metadata anchored by `meta_blkaddr`.
     Primary,
+    /// Logical metadata inside the metabox inode.
+    Metabox,
 }
 
 /// Canonical object selector supported by M1.
@@ -52,6 +63,30 @@ pub enum ObjectRef {
         /// Dirent index within the directory block.
         index: u32,
     },
+    /// One raw 16-byte superblock extension slot.
+    SuperblockExtension { index: u8 },
+    /// One extra-device descriptor (zero-based).
+    DeviceSlot { index: u16 },
+    /// One chunk block/index entry.
+    Chunk { inode: u64, index: u64 },
+    /// Inline xattr header following an inode.
+    XattrHeader { inode: u64 },
+    /// Shared xattr ID inside an inline xattr header.
+    SharedXattrId { inode: u64, index: u32 },
+    /// Inline xattr entry after the shared-ID array.
+    InlineXattr { inode: u64, index: u32 },
+    /// Long xattr prefix metadata record.
+    XattrLongPrefix { index: u8 },
+    /// Compression configuration record selected by algorithm ID.
+    CompressionConfig { algorithm: u8 },
+    /// Compressed inode map header.
+    CompressionMap { inode: u64 },
+    /// Full compressed lcluster index.
+    CompressionIndex { inode: u64, index: u64 },
+    /// Compact compressed index pack.
+    CompressionCompactPack { inode: u64, index: u64 },
+    /// Compressed extent record.
+    CompressionExtent { inode: u64, index: u64 },
 }
 
 /// Decoded field value without heap allocation.
@@ -59,8 +94,8 @@ pub enum ObjectRef {
 pub enum DecodedValue {
     /// Unsigned scalar value.
     Unsigned(u64),
-    /// Fixed bytes, with the valid prefix indicated by `len`.
-    Bytes { bytes: [u8; 16], len: u8 },
+    /// Fixed or bounded variable bytes, with the valid prefix indicated by `len`.
+    Bytes { bytes: [u8; 64], len: u8 },
 }
 
 /// One read on which an occurrence location depends.
@@ -73,8 +108,8 @@ pub struct DependencyRead {
     /// Decoded unsigned value.
     pub value: u64,
 }
-type Provenance = [Option<DependencyRead>; 4];
-type LocatedObject = (u64, StructureId, Provenance);
+type Provenance = [Option<DependencyRead>; 6];
+type LocatedObject = (u64, StructureId, Provenance, Option<u64>);
 
 /// A resolved field instance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,13 +121,13 @@ pub struct FieldOccurrence {
     /// Absolute field range.
     pub span: Span,
     /// Original bytes, with the valid prefix indicated by `raw_len`.
-    pub raw: [u8; 16],
+    pub raw: [u8; 64],
     /// Number of valid bytes in `raw`.
     pub raw_len: u8,
     /// Decoded field value.
     pub value: DecodedValue,
     /// Location dependency reads, packed at the start.
-    pub provenance: [Option<DependencyRead>; 4],
+    pub provenance: [Option<DependencyRead>; 6],
 }
 
 /// Versioned capability that is known but not implemented by this locator.
@@ -152,6 +187,18 @@ pub struct SuperblockContext {
     pub feature_incompat: u32,
     /// Primary metadata starting block.
     pub meta_blkaddr: u32,
+    /// Compatible feature bits.
+    pub feature_compat: u32,
+    /// Shared xattr starting block.
+    pub xattr_blkaddr: u32,
+    /// Extra-device count.
+    pub extra_devices: u16,
+    /// Device-table slot offset.
+    pub devt_slotoff: u16,
+    /// Long-prefix record count.
+    pub xattr_prefix_count: u8,
+    /// Long-prefix logical start in 4-byte units.
+    pub xattr_prefix_start: u32,
 }
 
 /// Read-only locator bound to one image.
@@ -172,16 +219,22 @@ impl<'a, R: ReadAt> Locator<'a, R> {
         let span = Span::new(SUPERBLOCK_OFFSET, SUPERBLOCK_BASE_SIZE)
             .map_err(|_| LocateError::Overflow)?;
         ensure_span::<R::Error>(span, image.len())?;
-        let mut prefix = [0; 84];
+        let mut prefix = [0; 104];
         image
             .read_exact_at(SUPERBLOCK_OFFSET, &mut prefix)
             .map_err(LocateError::Read)?;
         let superblock = SuperblockContext {
             magic: le_u32(prefix[..4].try_into().unwrap()),
+            feature_compat: le_u32(prefix[8..12].try_into().unwrap()),
             blkszbits: prefix[12],
             ext_slots: prefix[13],
             meta_blkaddr: le_u32(prefix[40..44].try_into().unwrap()),
+            xattr_blkaddr: le_u32(prefix[44..48].try_into().unwrap()),
             feature_incompat: le_u32(prefix[80..84].try_into().unwrap()),
+            extra_devices: le_u16(prefix[86..88].try_into().unwrap()),
+            devt_slotoff: le_u16(prefix[88..90].try_into().unwrap()),
+            xattr_prefix_count: prefix[91],
+            xattr_prefix_start: le_u32(prefix[92..96].try_into().unwrap()),
         };
         if mode == ParseMode::Strict {
             if superblock.magic != crate::SUPERBLOCK_MAGIC {
@@ -221,14 +274,36 @@ impl<'a, R: ReadAt> Locator<'a, R> {
         object: ObjectRef,
         field: &'static FieldDef,
     ) -> Result<FieldOccurrence, LocateError<R::Error>> {
-        let (base, structure, provenance) = match object {
-            ObjectRef::Superblock => (SUPERBLOCK_OFFSET, StructureId::Superblock, [None; 4]),
+        let (base, structure, provenance, dynamic_len) = match object {
+            ObjectRef::Superblock => (SUPERBLOCK_OFFSET, StructureId::Superblock, [None; 6], None),
             ObjectRef::Inode { space, nid } => self.locate_inode(space, nid)?,
             ObjectRef::Dirent {
                 directory,
                 block,
                 index,
             } => self.locate_dirent(directory, block, index)?,
+            ObjectRef::SuperblockExtension { index } => self.locate_extension(index)?,
+            ObjectRef::DeviceSlot { index } => self.locate_device(index)?,
+            ObjectRef::Chunk { inode, index } => self.locate_chunk(inode, index)?,
+            ObjectRef::XattrHeader { inode } => self.locate_xattr_header(inode)?,
+            ObjectRef::SharedXattrId { inode, index } => {
+                self.locate_shared_xattr_id(inode, index)?
+            }
+            ObjectRef::InlineXattr { inode, index } => self.locate_inline_xattr(inode, index)?,
+            ObjectRef::XattrLongPrefix { index } => self.locate_xattr_prefix(index)?,
+            ObjectRef::CompressionConfig { algorithm } => {
+                self.locate_compression_config(algorithm)?
+            }
+            ObjectRef::CompressionMap { inode } => self.locate_compression_map(inode)?,
+            ObjectRef::CompressionIndex { inode, index } => {
+                self.locate_compression_index(inode, index)?
+            }
+            ObjectRef::CompressionCompactPack { inode, index } => {
+                self.locate_compact_pack(inode, index)?
+            }
+            ObjectRef::CompressionExtent { inode, index } => {
+                self.locate_compression_extent(inode, index)?
+            }
         };
         if field.structure != structure {
             return Err(LocateError::ObjectMismatch {
@@ -237,13 +312,18 @@ impl<'a, R: ReadAt> Locator<'a, R> {
             });
         }
         self.check_presence(field)?;
-        let offset = base
-            .checked_add(field.storage.offset)
-            .ok_or(LocateError::Overflow)?;
-        let span = Span::new(offset, field.storage.len).map_err(|_| LocateError::Overflow)?;
+        self.check_object_field(structure, dynamic_len, field, object)?;
+        let relative = if field.storage.len == 0 && field.id.ends_with(".value") {
+            4 + u64::from(self.read_u8(base)?)
+        } else {
+            field.storage.offset
+        };
+        let offset = base.checked_add(relative).ok_or(LocateError::Overflow)?;
+        let len = self.dynamic_field_len(base, field, dynamic_len)?;
+        let span = Span::new(offset, len).map_err(|_| LocateError::Overflow)?;
         ensure_span::<R::Error>(span, self.image.len())?;
-        let raw_len = u8::try_from(field.storage.len).map_err(|_| LocateError::Overflow)?;
-        let mut raw = [0; 16];
+        let raw_len = u8::try_from(len).map_err(|_| LocateError::Overflow)?;
+        let mut raw = [0; 64];
         self.image
             .read_exact_at(offset, &mut raw[..usize::from(raw_len)])
             .map_err(LocateError::Read)?;
@@ -277,6 +357,16 @@ impl<'a, R: ReadAt> Locator<'a, R> {
                     + u64::from(self.superblock.ext_slots) * SUPERBLOCK_EXTSLOT_SIZE
                     >= 144
             }
+            Predicate::WithMetabox => {
+                self.superblock.feature_incompat & FEATURE_INCOMPAT_METABOX != 0
+            }
+            Predicate::WithXattrPrefixes => {
+                self.superblock.feature_incompat & FEATURE_INCOMPAT_XATTR_PREFIXES != 0
+            }
+            Predicate::WithDeviceTable => {
+                self.superblock.feature_incompat & FEATURE_INCOMPAT_DEVICE_TABLE != 0
+            }
+            Predicate::Dynamic => true,
         };
         if enabled {
             Ok(())
@@ -288,17 +378,58 @@ impl<'a, R: ReadAt> Locator<'a, R> {
         }
     }
 
+    fn check_object_field(
+        &self,
+        structure: StructureId,
+        object_len: Option<u64>,
+        field: &FieldDef,
+        object: ObjectRef,
+    ) -> Result<(), LocateError<R::Error>> {
+        let compatible = match structure {
+            StructureId::ChunkEntry if object_len == Some(4) => field.id == "erofs.chunk.block",
+            StructureId::ChunkEntry if object_len == Some(8) => {
+                field.id != "erofs.chunk.block"
+                    && (field.id != "erofs.chunk.startblk_hi" || self.chunk_uses_48bit(object)?)
+            }
+            StructureId::CompressionExtent => field.storage.offset < object_len.unwrap_or(0),
+            _ => true,
+        };
+        if compatible {
+            Ok(())
+        } else {
+            Err(LocateError::ObjectMismatch {
+                field_structure: field.structure,
+                object,
+            })
+        }
+    }
+
+    fn chunk_uses_48bit(&self, object: ObjectRef) -> Result<bool, LocateError<R::Error>> {
+        let ObjectRef::Chunk { inode, .. } = object else {
+            return Ok(false);
+        };
+        let (base, _, _, _) = self.inode_tail(inode)?;
+        Ok(self.read_u16(base + 16)? & crate::CHUNK_FORMAT_48BIT != 0)
+    }
+
     fn locate_inode(
         &self,
         space: MetadataSpace,
         nid: u64,
     ) -> Result<LocatedObject, LocateError<R::Error>> {
-        if space != MetadataSpace::Primary {
-            return Err(LocateError::UnsupportedCapability(Capability::Metabox));
-        }
-        let offset =
-            primary_inode_offset(self.superblock.meta_blkaddr, self.superblock.blkszbits, nid)
-                .map_err(|_| LocateError::Overflow)?;
+        let offset = match space {
+            MetadataSpace::Primary => {
+                primary_inode_offset(self.superblock.meta_blkaddr, self.superblock.blkszbits, nid)
+                    .map_err(|_| LocateError::Overflow)?
+            }
+            MetadataSpace::Metabox => {
+                if self.superblock.feature_incompat & FEATURE_INCOMPAT_METABOX == 0 {
+                    return Err(LocateError::UnsupportedCapability(Capability::Metabox));
+                }
+                nid.checked_mul(crate::INODE_SLOT_SIZE)
+                    .ok_or(LocateError::Overflow)?
+            }
+        };
         let format_span = Span::new(offset, 2).map_err(|_| LocateError::Overflow)?;
         ensure_span::<R::Error>(format_span, self.image.len())?;
         let format = self.read_u16(offset)?;
@@ -321,16 +452,408 @@ impl<'a, R: ReadAt> Locator<'a, R> {
             offset,
             structure,
             self.inode_provenance(format_span, format, nid),
+            None,
         ))
     }
 
+    fn locate_extension(&self, index: u8) -> Result<LocatedObject, LocateError<R::Error>> {
+        if index >= self.superblock.ext_slots {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::SuperblockExtension { index },
+                reason: "extension slot is outside sb_extslots",
+            });
+        }
+        let base = SUPERBLOCK_OFFSET
+            .checked_add(SUPERBLOCK_BASE_SIZE)
+            .and_then(|v| v.checked_add(u64::from(index) * SUPERBLOCK_EXTSLOT_SIZE))
+            .ok_or(LocateError::Overflow)?;
+        Ok((base, StructureId::SuperblockExtension, [None; 6], None))
+    }
+
+    fn locate_device(&self, index: u16) -> Result<LocatedObject, LocateError<R::Error>> {
+        if self.superblock.feature_incompat & FEATURE_INCOMPAT_DEVICE_TABLE == 0 {
+            return Err(LocateError::UnsupportedCapability(
+                Capability::ChunkDirectory,
+            ));
+        }
+        if index >= self.superblock.extra_devices {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::DeviceSlot { index },
+                reason: "device index is outside extra_devices",
+            });
+        }
+        let base = u64::from(self.superblock.devt_slotoff)
+            .checked_mul(DEVICE_SLOT_SIZE)
+            .and_then(|v| v.checked_add(u64::from(index) * DEVICE_SLOT_SIZE))
+            .ok_or(LocateError::Overflow)?;
+        ensure_span::<R::Error>(
+            Span::new(base, DEVICE_SLOT_SIZE).map_err(|_| LocateError::Overflow)?,
+            self.image.len(),
+        )?;
+        Ok((base, StructureId::DeviceSlot, [None; 6], None))
+    }
+
+    fn inode_tail(&self, inode: u64) -> Result<(u64, u64, u16, u64), LocateError<R::Error>> {
+        let (base, structure, _, _) = self.locate_inode(MetadataSpace::Primary, inode)?;
+        let inode_size = if structure == StructureId::CompactInode {
+            COMPACT_INODE_SIZE
+        } else {
+            EXTENDED_INODE_SIZE
+        };
+        let format = self.read_u16(base)?;
+        let count = u64::from(self.read_u16(base + 2)?);
+        let xattr_size = if count == 0 {
+            0
+        } else {
+            XATTR_HEADER_SIZE + (count - 1) * 4
+        };
+        let end = base
+            .checked_add(inode_size)
+            .and_then(|v| v.checked_add(xattr_size))
+            .ok_or(LocateError::Overflow)?;
+        Ok((base, end, format, xattr_size))
+    }
+
+    fn locate_chunk(&self, inode: u64, index: u64) -> Result<LocatedObject, LocateError<R::Error>> {
+        let (base, end, format, _) = self.inode_tail(inode)?;
+        if (format & INODE_LAYOUT_MASK) >> INODE_LAYOUT_SHIFT != LAYOUT_CHUNK {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::Chunk { inode, index },
+                reason: "inode is not chunk based",
+            });
+        }
+        let chunk_format = self.read_u16(base + 16)?;
+        if self.mode == ParseMode::Strict && chunk_format & !CHUNK_FORMAT_ALL != 0 {
+            return Err(LocateError::InvalidStructure {
+                object: ObjectRef::Chunk { inode, index },
+                reason: "chunk format has reserved bits set",
+            });
+        }
+        let unit = if chunk_format & CHUNK_FORMAT_INDEXES != 0 {
+            8
+        } else {
+            4
+        };
+        let table = align_up(end, unit)?;
+        let entry = table
+            .checked_add(index.checked_mul(unit).ok_or(LocateError::Overflow)?)
+            .ok_or(LocateError::Overflow)?;
+        let size = if self.read_u16(base)? & INODE_EXTENDED_BIT == 0 {
+            u64::from(self.read_u32(base + 8)?)
+        } else {
+            self.read_u64(base + 8)?
+        };
+        let chunkbits = u32::from(self.superblock.blkszbits)
+            + u32::from(chunk_format & crate::CHUNK_FORMAT_BLKBITS_MASK);
+        let chunks = size
+            .checked_add((1_u64 << chunkbits) - 1)
+            .ok_or(LocateError::Overflow)?
+            >> chunkbits;
+        if index >= chunks {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::Chunk { inode, index },
+                reason: "chunk index is outside inode size",
+            });
+        }
+        Ok((
+            entry,
+            StructureId::ChunkEntry,
+            self.inode_provenance(
+                Span {
+                    offset: base,
+                    len: 2,
+                },
+                format,
+                inode,
+            ),
+            Some(unit),
+        ))
+    }
+
+    fn locate_xattr_header(&self, inode: u64) -> Result<LocatedObject, LocateError<R::Error>> {
+        let (base, end, _, xattr_size) = self.inode_tail(inode)?;
+        if xattr_size == 0 {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::XattrHeader { inode },
+                reason: "inode has no inline xattr region",
+            });
+        }
+        let offset = end.checked_sub(xattr_size).ok_or(LocateError::Overflow)?;
+        Ok((
+            offset,
+            StructureId::XattrHeader,
+            self.inode_provenance(
+                Span {
+                    offset: base,
+                    len: 2,
+                },
+                self.read_u16(base)?,
+                inode,
+            ),
+            None,
+        ))
+    }
+
+    fn locate_shared_xattr_id(
+        &self,
+        inode: u64,
+        index: u32,
+    ) -> Result<LocatedObject, LocateError<R::Error>> {
+        let (header, _, provenance, _) = self.locate_xattr_header(inode)?;
+        let count = u32::from(self.read_u8(header + 4)?);
+        if index >= count {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::SharedXattrId { inode, index },
+                reason: "shared xattr index is outside h_shared_count",
+            });
+        }
+        let base = header
+            .checked_add(12 + u64::from(index) * 4)
+            .ok_or(LocateError::Overflow)?;
+        Ok((base, StructureId::SharedXattrId, provenance, None))
+    }
+
+    fn locate_inline_xattr(
+        &self,
+        inode: u64,
+        index: u32,
+    ) -> Result<LocatedObject, LocateError<R::Error>> {
+        let (inode_base, tail, _, xattr_size) = self.inode_tail(inode)?;
+        if xattr_size == 0 {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::InlineXattr { inode, index },
+                reason: "inode has no inline xattr region",
+            });
+        }
+        let header = tail - xattr_size;
+        let shared = u64::from(self.read_u8(header + 4)?);
+        if 12 + shared * 4 > xattr_size {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::InlineXattr { inode, index },
+                reason: "shared xattr array exceeds inline region",
+            });
+        }
+        let mut pos = header + 12 + shared * 4;
+        for _ in 0..index {
+            if pos + 4 > tail {
+                return Err(LocateError::UnresolvedParent {
+                    object: ObjectRef::InlineXattr { inode, index },
+                    reason: "xattr index exceeds inline region",
+                });
+            }
+            let size = 4 + u64::from(self.read_u8(pos)?) + u64::from(self.read_u16(pos + 2)?);
+            pos = align_up(pos.checked_add(size).ok_or(LocateError::Overflow)?, 4)?;
+        }
+        if pos + 4 > tail {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::InlineXattr { inode, index },
+                reason: "xattr entry header exceeds inline region",
+            });
+        }
+        let size = align_up(
+            4 + u64::from(self.read_u8(pos)?) + u64::from(self.read_u16(pos + 2)?),
+            4,
+        )?;
+        if pos + size > tail {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::InlineXattr { inode, index },
+                reason: "xattr entry exceeds inline region",
+            });
+        }
+        Ok((
+            pos,
+            StructureId::XattrEntry,
+            self.inode_provenance(
+                Span {
+                    offset: inode_base,
+                    len: 2,
+                },
+                self.read_u16(inode_base)?,
+                inode,
+            ),
+            Some(size),
+        ))
+    }
+
+    fn locate_xattr_prefix(&self, index: u8) -> Result<LocatedObject, LocateError<R::Error>> {
+        if index >= self.superblock.xattr_prefix_count {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::XattrLongPrefix { index },
+                reason: "prefix index is outside xattr_prefix_count",
+            });
+        }
+        if self.superblock.feature_compat & 0x10 == 0 {
+            return Err(LocateError::UnsupportedCapability(Capability::Metabox));
+        }
+        let mut pos = u64::from(self.superblock.xattr_prefix_start)
+            .checked_mul(4)
+            .ok_or(LocateError::Overflow)?;
+        for _ in 0..index {
+            let len = metadata_length(self.read_u16(pos)?);
+            pos = align_up(pos.checked_add(2 + len).ok_or(LocateError::Overflow)?, 4)?;
+        }
+        let len = metadata_length(self.read_u16(pos)?);
+        if len == 0 || len > 256 {
+            return Err(LocateError::InvalidStructure {
+                object: ObjectRef::XattrLongPrefix { index },
+                reason: "invalid long-prefix payload length",
+            });
+        }
+        Ok((pos, StructureId::XattrLongPrefix, [None; 6], Some(len)))
+    }
+
+    fn locate_compression_config(
+        &self,
+        algorithm: u8,
+    ) -> Result<LocatedObject, LocateError<R::Error>> {
+        if self.superblock.feature_incompat & FEATURE_INCOMPAT_COMPR_CFGS == 0 {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::CompressionConfig { algorithm },
+                reason: "compression configuration feature is disabled",
+            });
+        }
+        if algorithm >= 4 {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::CompressionConfig { algorithm },
+                reason: "unknown compression algorithm",
+            });
+        }
+        let bitmap = self.read_u16(SUPERBLOCK_OFFSET + 84)?;
+        if bitmap & (1 << algorithm) == 0 {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::CompressionConfig { algorithm },
+                reason: "algorithm is absent from available_compr_algs",
+            });
+        }
+        let mut pos = SUPERBLOCK_OFFSET
+            + SUPERBLOCK_BASE_SIZE
+            + u64::from(self.superblock.ext_slots) * SUPERBLOCK_EXTSLOT_SIZE;
+        for id in 0..algorithm {
+            if bitmap & (1 << id) != 0 {
+                let len = metadata_length(self.read_u16(pos)?);
+                pos = align_up(pos.checked_add(2 + len).ok_or(LocateError::Overflow)?, 4)?;
+            }
+        }
+        let len = metadata_length(self.read_u16(pos)?);
+        Ok((pos, StructureId::CompressionConfig, [None; 6], Some(len)))
+    }
+
+    fn locate_compression_map(&self, inode: u64) -> Result<LocatedObject, LocateError<R::Error>> {
+        let (base, end, format, _) = self.inode_tail(inode)?;
+        let layout = (format & INODE_LAYOUT_MASK) >> INODE_LAYOUT_SHIFT;
+        if layout != LAYOUT_COMPRESSED_FULL && layout != LAYOUT_COMPRESSED_COMPACT {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::CompressionMap { inode },
+                reason: "inode is not compressed",
+            });
+        }
+        Ok((
+            align_up(end, 8)?,
+            StructureId::CompressionMap,
+            self.inode_provenance(
+                Span {
+                    offset: base,
+                    len: 2,
+                },
+                format,
+                inode,
+            ),
+            None,
+        ))
+    }
+
+    fn locate_compression_index(
+        &self,
+        inode: u64,
+        index: u64,
+    ) -> Result<LocatedObject, LocateError<R::Error>> {
+        let (map, _, provenance, _) = self.locate_compression_map(inode)?;
+        let base = map
+            .checked_add(16)
+            .and_then(|v| v.checked_add(index.checked_mul(8)?))
+            .ok_or(LocateError::Overflow)?;
+        Ok((base, StructureId::CompressionIndex, provenance, None))
+    }
+
+    fn locate_compact_pack(
+        &self,
+        inode: u64,
+        index: u64,
+    ) -> Result<LocatedObject, LocateError<R::Error>> {
+        let (map, _, provenance, _) = self.locate_compression_map(inode)?;
+        let unit = if self.read_u16(map + 4)? & 1 != 0 {
+            32
+        } else {
+            8
+        };
+        let start = align_up(map + 8, 8)?;
+        let base = start
+            .checked_add(index.checked_mul(unit).ok_or(LocateError::Overflow)?)
+            .ok_or(LocateError::Overflow)?;
+        Ok((
+            base,
+            StructureId::CompressionCompactPack,
+            provenance,
+            Some(unit),
+        ))
+    }
+
+    fn locate_compression_extent(
+        &self,
+        inode: u64,
+        index: u64,
+    ) -> Result<LocatedObject, LocateError<R::Error>> {
+        let (map, _, provenance, _) = self.locate_compression_map(inode)?;
+        let advise = self.read_u16(map + 4)?;
+        if advise & ADVISE_EXTENTS == 0 {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::CompressionExtent { inode, index },
+                reason: "compressed inode does not use extents",
+            });
+        }
+        let unit = 4_u64 << ((advise >> 1) & 3);
+        let mut start = align_up(map + 8, unit)?;
+        if unit == 4 {
+            start = start.checked_add(8).ok_or(LocateError::Overflow)?;
+        }
+        let base = start
+            .checked_add(index.checked_mul(unit).ok_or(LocateError::Overflow)?)
+            .ok_or(LocateError::Overflow)?;
+        Ok((base, StructureId::CompressionExtent, provenance, Some(unit)))
+    }
+
+    fn dynamic_field_len(
+        &self,
+        base: u64,
+        field: &FieldDef,
+        object_len: Option<u64>,
+    ) -> Result<u64, LocateError<R::Error>> {
+        if field.storage.len != 0 {
+            return Ok(field.storage.len);
+        }
+        let len = match field.id {
+            "erofs.xattr.entry.name" => u64::from(self.read_u8(base)?),
+            "erofs.xattr.entry.value" => u64::from(self.read_u16(base + 2)?),
+            "erofs.xattr.prefix.infix" => object_len.unwrap_or(0).saturating_sub(1),
+            "erofs.compression.config.payload" => object_len.unwrap_or(0),
+            "erofs.compression.compact_pack.raw" => object_len.unwrap_or(0),
+            _ => object_len.unwrap_or(0),
+        };
+        if len > 64 {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::Superblock,
+                reason: "variable field exceeds bounded occurrence buffer",
+            });
+        }
+        Ok(len)
+    }
     fn locate_dirent(
         &self,
         directory: u64,
         block: u64,
         index: u32,
     ) -> Result<LocatedObject, LocateError<R::Error>> {
-        let (inode_offset, inode_structure, inode_provenance) =
+        let (inode_offset, inode_structure, inode_provenance, _) =
             self.locate_inode(MetadataSpace::Primary, directory)?;
         let format = inode_provenance[3].unwrap().value as u16;
         let layout = (format & INODE_LAYOUT_MASK) >> INODE_LAYOUT_SHIFT;
@@ -471,7 +994,7 @@ impl<'a, R: ReadAt> Locator<'a, R> {
                 reason: "dirent index is outside the declared header array",
             });
         }
-        Ok((offset, StructureId::Dirent, inode_provenance))
+        Ok((offset, StructureId::Dirent, inode_provenance, None))
     }
 
     fn inode_provenance(
@@ -479,7 +1002,7 @@ impl<'a, R: ReadAt> Locator<'a, R> {
         format_span: Span,
         format: u16,
         nid: u64,
-    ) -> [Option<DependencyRead>; 4] {
+    ) -> [Option<DependencyRead>; 6] {
         [
             Some(DependencyRead {
                 field: "erofs.superblock.blkszbits",
@@ -507,9 +1030,18 @@ impl<'a, R: ReadAt> Locator<'a, R> {
                 span: format_span,
                 value: u64::from(format),
             }),
+            None,
+            None,
         ]
     }
 
+    fn read_u8(&self, offset: u64) -> Result<u8, LocateError<R::Error>> {
+        let mut raw = [0; 1];
+        self.image
+            .read_exact_at(offset, &mut raw)
+            .map_err(LocateError::Read)?;
+        Ok(raw[0])
+    }
     fn read_u16(&self, offset: u64) -> Result<u16, LocateError<R::Error>> {
         let mut raw = [0; 2];
         self.image
@@ -535,7 +1067,7 @@ impl<'a, R: ReadAt> Locator<'a, R> {
     }
 }
 
-fn decode(encoding: Encoding, raw: [u8; 16], len: u8) -> DecodedValue {
+fn decode(encoding: Encoding, raw: [u8; 64], len: u8) -> DecodedValue {
     match encoding {
         Encoding::U8 => DecodedValue::Unsigned(u64::from(raw[0])),
         Encoding::LeU16 => DecodedValue::Unsigned(u64::from(le_u16(raw[..2].try_into().unwrap()))),
@@ -543,6 +1075,17 @@ fn decode(encoding: Encoding, raw: [u8; 16], len: u8) -> DecodedValue {
         Encoding::LeU64 => DecodedValue::Unsigned(le_u64(raw[..8].try_into().unwrap())),
         Encoding::Bytes => DecodedValue::Bytes { bytes: raw, len },
     }
+}
+
+fn align_up<E>(value: u64, alignment: u64) -> Result<u64, LocateError<E>> {
+    value
+        .checked_add(alignment - 1)
+        .map(|v| v / alignment * alignment)
+        .ok_or(LocateError::Overflow)
+}
+
+fn metadata_length(raw: u16) -> u64 {
+    if raw == 0 { 65_536 } else { u64::from(raw) }
 }
 
 fn ensure_span<E>(span: Span, image_len: u64) -> Result<(), LocateError<E>> {
@@ -693,5 +1236,111 @@ mod tests {
             ),
             Err(LocateError::Overflow)
         ));
+    }
+    #[test]
+    fn locates_chunk_index_device_and_48bit_fields() {
+        let mut image = image();
+        image[1104..1108].copy_from_slice(
+            &(FEATURE_INCOMPAT_48BIT | FEATURE_INCOMPAT_DEVICE_TABLE).to_le_bytes(),
+        );
+        image[1110..1112].copy_from_slice(&1_u16.to_le_bytes());
+        image[1112..1114].copy_from_slice(&96_u16.to_le_bytes());
+        let device = 96 * 128;
+        image[device + 74..device + 76].copy_from_slice(&2_u16.to_le_bytes());
+        let inode = 4096 + 3 * 32;
+        image[inode..inode + 2].copy_from_slice(&(LAYOUT_CHUNK << 1).to_le_bytes());
+        image[inode + 8..inode + 12].copy_from_slice(&4096_u32.to_le_bytes());
+        image[inode + 16..inode + 18].copy_from_slice(&CHUNK_FORMAT_INDEXES.to_le_bytes());
+        image[inode + 34..inode + 36].copy_from_slice(&7_u16.to_le_bytes());
+        let reader = SliceReader::new(&image);
+        let locator = Locator::new(&reader).unwrap();
+        let chunk = locator
+            .locate(
+                ObjectRef::Chunk { inode: 3, index: 0 },
+                field_by_id("erofs.chunk.device_id").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(chunk.value, DecodedValue::Unsigned(7));
+        let high = locator
+            .locate(
+                ObjectRef::DeviceSlot { index: 0 },
+                field_by_id("erofs.device.uniaddr_hi").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(high.value, DecodedValue::Unsigned(2));
+    }
+
+    #[test]
+    fn locates_inline_xattr_and_compression_metadata() {
+        let mut image = image();
+        let inode = 4096 + 3 * 32;
+        image[inode..inode + 2].copy_from_slice(&(LAYOUT_COMPRESSED_FULL << 1).to_le_bytes());
+        image[inode + 2..inode + 4].copy_from_slice(&5_u16.to_le_bytes());
+        let header = inode + 32;
+        image[header + 4] = 1;
+        image[header + 12..header + 16].copy_from_slice(&9_u32.to_le_bytes());
+        image[header + 16] = 1;
+        image[header + 17] = 6;
+        image[header + 18..header + 20].copy_from_slice(&3_u16.to_le_bytes());
+        let map = 4256;
+        image[map + 4..map + 6].copy_from_slice(&0_u16.to_le_bytes());
+        image[map + 6] = 0x10;
+        let reader = SliceReader::new(&image);
+        let locator = Locator::new(&reader).unwrap();
+        let shared = locator
+            .locate(
+                ObjectRef::SharedXattrId { inode: 3, index: 0 },
+                field_by_id("erofs.xattr.shared_id").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(shared.value, DecodedValue::Unsigned(9));
+        let entry = locator
+            .locate(
+                ObjectRef::InlineXattr { inode: 3, index: 0 },
+                field_by_id("erofs.xattr.entry.value_size").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(entry.value, DecodedValue::Unsigned(3));
+        let algorithm = locator
+            .locate(
+                ObjectRef::CompressionMap { inode: 3 },
+                field_by_id("erofs.compression.map.algorithmtype").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(algorithm.value, DecodedValue::Unsigned(0x10));
+    }
+
+    #[test]
+    fn locates_plain_long_prefix_and_metabox_inode() {
+        let mut image = image();
+        image[1032..1036].copy_from_slice(&0x10_u32.to_le_bytes());
+        image[1104..1108].copy_from_slice(
+            &(FEATURE_INCOMPAT_XATTR_PREFIXES | FEATURE_INCOMPAT_METABOX).to_le_bytes(),
+        );
+        image[1115] = 1;
+        image[1116..1120].copy_from_slice(&800_u32.to_le_bytes());
+        image[3200..3202].copy_from_slice(&3_u16.to_le_bytes());
+        image[3202] = 1;
+        image[3203..3205].copy_from_slice(b"ab");
+        image[64..66].copy_from_slice(&0_u16.to_le_bytes());
+        let reader = SliceReader::new(&image);
+        let locator = Locator::new(&reader).unwrap();
+        let infix = locator
+            .locate(
+                ObjectRef::XattrLongPrefix { index: 0 },
+                field_by_id("erofs.xattr.prefix.infix").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(&infix.raw[..2], b"ab");
+        let inode = locator
+            .locate(
+                ObjectRef::Inode {
+                    space: MetadataSpace::Metabox,
+                    nid: 2,
+                },
+                field_by_id("erofs.inode.compact.i_format").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(inode.span.offset, 64);
     }
 }

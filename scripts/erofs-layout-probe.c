@@ -49,6 +49,23 @@ CHECK_OFFSET(erofs_dirent, nameoff, 8);
 CHECK_OFFSET(erofs_dirent, file_type, 10);
 CHECK_OFFSET(erofs_dirent, reserved, 11);
 
+CHECK_SIZE(erofs_deviceslot, 128);
+CHECK_OFFSET(erofs_deviceslot, blocks_lo, 64);
+CHECK_OFFSET(erofs_deviceslot, uniaddr_hi, 74);
+CHECK_SIZE(erofs_xattr_ibody_header, 12);
+CHECK_SIZE(erofs_xattr_entry, 4);
+CHECK_SIZE(erofs_inode_chunk_info, 4);
+CHECK_SIZE(erofs_inode_chunk_index, 8);
+CHECK_OFFSET(erofs_inode_chunk_index, device_id, 2);
+CHECK_OFFSET(erofs_inode_chunk_index, startblk_lo, 4);
+CHECK_SIZE(z_erofs_map_header, 8);
+CHECK_OFFSET(z_erofs_map_header, h_advise, 4);
+CHECK_SIZE(z_erofs_lcluster_index, 8);
+CHECK_OFFSET(z_erofs_lcluster_index, di_clusterofs, 2);
+CHECK_SIZE(z_erofs_extent, 32);
+CHECK_OFFSET(z_erofs_extent, pstart_hi, 8);
+CHECK_OFFSET(z_erofs_extent, lstart_hi, 16);
+
 int main(void)
 {
 	return 0;
