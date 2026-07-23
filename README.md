@@ -121,6 +121,30 @@ erofs-cli field locate image.erofs --object dirent --nid 36 --block 0 --index 0 
   --field erofs.dirent.nameoff --mode tolerant --json
 ```
 
+### Deterministic mutation and replay
+
+M2 resolves symbolic mutations against an immutable baseline, records exact
+before/after patches, publishes samples by SHA-256, and replays manifests
+without invoking the current locator. Canonical samples are read-only and live
+under `samples/sha256/<output-sha256>`.
+
+```bash
+erofs-cli inject set image.erofs --output-dir corpus \
+  --object superblock --field erofs.superblock.fixed_nsec --value 1 \
+  --integrity recalculate
+erofs-cli inject bits image.erofs --output-dir corpus \
+  --object superblock --field erofs.superblock.feature_compat --set 0x2
+erofs-cli inject bytes image.erofs --output-dir corpus \
+  --object superblock --field erofs.superblock.volume_name \
+  --hex 65726f66732d6d75746174696f6e0000
+erofs-cli inject raw image.erofs --output-dir corpus \
+  --offset 0x428 --hex ff00aa55 --mode raw
+erofs-cli inject truncate image.erofs --output-dir corpus \
+  --length 3072 --mode raw
+erofs-cli replay corpus/samples/sha256/HASH/sample.json \
+  --parent image.erofs --output-dir replayed-corpus
+```
+
 ## Status
 
 ### Implemented
