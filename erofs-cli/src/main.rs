@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod campaign;
 mod convert;
 mod dump;
 mod field;
@@ -11,6 +12,7 @@ mod replay;
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    Campaign(campaign::CampaignArgs),
     Dump(dump::DumpArgs),
     Field(field::FieldArgs),
     Inject(inject::InjectArgs),
@@ -31,6 +33,7 @@ async fn main() -> Result<()> {
     let opt = Opt::parse();
 
     match opt.command {
+        Commands::Campaign(args) => campaign::campaign(args),
         Commands::Dump(args) => dump::dump(args).await,
         Commands::Field(args) => field::field(args),
         Commands::Inject(args) => inject::inject(args),

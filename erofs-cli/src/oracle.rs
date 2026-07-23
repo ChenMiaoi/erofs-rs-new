@@ -17,11 +17,22 @@ enum OracleCommand {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum Profile {
+pub enum Profile {
     RustFull,
     FsckFull,
     FsckNoSbcrc,
     LinuxKasan,
+}
+
+impl From<Profile> for OracleProfile {
+    fn from(value: Profile) -> Self {
+        match value {
+            Profile::RustFull => Self::RustFull,
+            Profile::FsckFull => Self::FsckFull,
+            Profile::FsckNoSbcrc => Self::FsckNoSbcrc,
+            Profile::LinuxKasan => Self::LinuxKasan,
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -44,30 +55,24 @@ pub fn oracle(args: OracleArgs) -> Result<()> {
     }
 }
 
-fn run(args: RunArgs) -> Result<()> {
-    let profile = match args.profile {
-        Profile::RustFull => OracleProfile::RustFull,
-        Profile::FsckFull => OracleProfile::FsckFull,
-        Profile::FsckNoSbcrc => OracleProfile::FsckNoSbcrc,
-        Profile::LinuxKasan => OracleProfile::LinuxKasan,
-    };
-    let workspace = args.workspace.canonicalize().with_context(|| {
-        format!(
-            "failed to canonicalize workspace {}",
-            args.workspace.display()
-        )
-    })?;
+pub fn oracle_paths(workspace: &std::path::Path) -> Result<OraclePaths> {
+    let workspace = workspace
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize workspace {}", workspace.display()))?;
     let current = env::current_exe()?;
-    let reader_oracle = current.with_file_name("erofs-reader-oracle");
-    let qemu = which("qemu-system-x86_64")?;
-    let paths = OraclePaths {
-        reader_oracle,
+    Ok(OraclePaths {
+        reader_oracle: current.with_file_name("erofs-reader-oracle"),
         fsck: workspace.join("build/erofs-utils/fsck/fsck.erofs"),
-        qemu,
+        qemu: which("qemu-system-x86_64")?,
         kernel: workspace.join("build/linux/arch/x86/boot/bzImage"),
         initramfs: workspace.join("build/initramfs.cpio.gz"),
         kernel_config: workspace.join("build/linux/.config"),
-    };
+    })
+}
+
+fn run(args: RunArgs) -> Result<()> {
+    let profile = OracleProfile::from(args.profile);
+    let paths = oracle_paths(&args.workspace)?;
     let mut limits = ResourceLimits::default();
     if let Some(timeout) = args.timeout_ms {
         limits.timeout_ms = timeout;

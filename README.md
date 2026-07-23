@@ -167,6 +167,30 @@ Profiles record complete argv, fixed environment, resource limits, binary and
 kernel/config/initramfs hashes, exit status, signal, wall time, bounded logs,
 classifier rule, phase, status, and stable signature.
 
+### Deterministic campaigns and minimization
+
+M4 records `chacha12/v1` recipes, deterministic field enumeration, dependency-aware
+combinations, byte/plan/result novelty identities, and a Rust → fsck → Linux
+escalation funnel with explicit sample, mutation, image, oracle, and wall-time
+budgets.
+
+```bash
+erofs-cli campaign run image.erofs --output-dir corpus --seed 17 \
+  --field erofs.superblock.magic \
+  --field erofs.superblock.fixed_nsec \
+  --max-samples 64 --max-mutations 4 --max-oracle-runs 64 \
+  --funnel novelty --integrity preserve
+
+erofs-cli campaign minimize image.erofs --output-dir corpus \
+  --recipe corpus/campaigns/CAMPAIGN/recipe.json --case CASE_ID \
+  --profile rust-full --signature rust:superblock_parse \
+  --confirmations 2
+```
+
+Minimization removes intent groups first, then shrinks field values, bit sets,
+raw patches, and truncate deltas. Every candidate regenerates integrity repair
+and must reproduce the same signature repeatedly in the same profile.
+
 ## Status
 
 ### Implemented
