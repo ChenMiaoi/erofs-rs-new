@@ -37,23 +37,28 @@ classify_dmesg() {
     fi
 
     # 2. Expected clean rejection.
-    if grep -q "== erofs mount rejected safely ==" "$dmesg_path"; then
+    if grep -q "EROFS_ORACLE phase=mount status=rejected" "$dmesg_path"; then
         REPLAY_RESULT="REJECTED"
-        REPLAY_MSG=$(grep "erofs (device vda):" "$dmesg_path" | tail -1 | sed 's/.*erofs (device vda): //')
-        [[ -z "$REPLAY_MSG" ]] && REPLAY_MSG="rejected without message"
+        REPLAY_MSG="mount rejected cleanly"
         return
     fi
 
-    # 3. Successful mount and full traversal.  The booted marker is printed
-    # before aggressive traversal, so require the traversal-complete marker
-    # to avoid classifying a traversal hang as ACCEPTED.
-    if grep -q "== erofs traversal complete ==" "$dmesg_path"; then
+    # 3. Acceptance is committed only after complete traversal and EOF reads.
+    if grep -q "EROFS_ORACLE phase=complete status=accepted" "$dmesg_path"; then
         REPLAY_RESULT="ACCEPTED"
-        REPLAY_MSG="mounted and traversed successfully"
+        REPLAY_MSG=$(grep "EROFS_ORACLE phase=traverse status=accepted" "$dmesg_path" | tail -1)
+        [[ -z "$REPLAY_MSG" ]] && REPLAY_MSG="mounted and traversed successfully"
         return
     fi
 
-    # 4. Timeout or unknown.
+    # 4. A guest-side traversal/read failure is a clean format rejection.
+    if grep -qE "EROFS_ORACLE phase=(readdir|inode|read_data|traverse) status=rejected" "$dmesg_path"; then
+        REPLAY_RESULT="REJECTED"
+        REPLAY_MSG=$(grep -E "EROFS_ORACLE phase=(readdir|inode|read_data|traverse) status=rejected" "$dmesg_path" | tail -1)
+        return
+    fi
+
+    # 5. Timeout or unknown.
     if [[ "$qemu_rc" -eq 124 ]]; then
         REPLAY_RESULT="TIMEOUT"
         REPLAY_MSG="QEMU timeout"

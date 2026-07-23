@@ -20,7 +20,8 @@ INITRAMFS := $(BUILD)/initramfs.cpio.gz
 EROFS_SRC := $(BUILD)/erofs-root
 EROFS_IMG := $(BUILD)/rootfs.erofs
 MKFS_EROFS := $(EROFS_UTILS_BUILD)/mkfs/mkfs.erofs
-EROFS_DRIVE := -drive file=$(EROFS_IMG),if=virtio,format=raw,readonly=on
+SAMPLE ?= $(EROFS_IMG)
+EROFS_DRIVE = -drive file=$(abspath $(SAMPLE)),if=virtio,format=raw,readonly=on
 
 KERNEL_CMDLINE := console=ttyS0 earlyprintk=serial panic=-1
 QEMU_ARGS := \
@@ -34,7 +35,7 @@ QEMU_ARGS := \
 	-initrd $(INITRAMFS) \
 	-append "$(KERNEL_CMDLINE)"
 
-.PHONY: all apt-deps deps-check kernel-config kernel erofs-utils initramfs erofs-image run smoke clean distclean help
+.PHONY: all apt-deps deps-check kernel-config kernel erofs-utils initramfs erofs-image run smoke oracle clean distclean help
 
 all: kernel initramfs erofs-image
 
@@ -50,6 +51,7 @@ help:
 		'  make erofs-image    Build build/rootfs.erofs' \
 		'  make run            Build everything and boot vendor Linux in QEMU' \
 		'  make smoke          Boot with a timeout and verify mount plus traversal' \
+		'  make oracle SAMPLE=x Boot an arbitrary read-only EROFS sample' \
 		'  make clean          Remove generated build artifacts'
 
 apt-deps:
@@ -113,6 +115,18 @@ erofs-image: erofs-utils
 
 run: all
 	$(QEMU) $(QEMU_ARGS) $(EROFS_DRIVE)
+
+oracle: kernel initramfs
+	@test -f "$(SAMPLE)" || { echo "Sample not found: $(SAMPLE)"; exit 1; }
+	@mkdir -p $(BUILD)
+	@set -o pipefail; \
+	source scripts/kernel-replay-common.sh; \
+	timeout 80s $(QEMU) $(QEMU_ARGS) $(EROFS_DRIVE) 2>&1 | tee $(BUILD)/qemu-oracle.log || rc=$$?; \
+	qemu_rc="$${rc:-0}"; \
+	if [ "$$qemu_rc" != 0 ] && [ "$$qemu_rc" != 124 ]; then exit "$$qemu_rc"; fi; \
+	classify_dmesg "$(BUILD)/qemu-oracle.log" "$$qemu_rc"; \
+	echo "$$REPLAY_RESULT: $$REPLAY_MSG"; \
+	if [ "$$REPLAY_RESULT" != "ACCEPTED" ] && [ "$$REPLAY_RESULT" != "REJECTED" ]; then exit 1; fi
 
 smoke: all
 	@mkdir -p $(BUILD)

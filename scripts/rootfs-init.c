@@ -97,63 +97,81 @@ static void list_files(const char *path, int depth)
 	closedir(dir);
 }
 
-static void traverse_all(const char *path)
+struct traversal_stats {
+	unsigned long nodes;
+	unsigned long regular_files;
+	unsigned long symlinks;
+	unsigned long long bytes_read;
+	int failed;
+};
+
+static void traverse_all(const char *path, struct traversal_stats *stats)
 {
-	/*
-	 * Aggressive traversal: recursively walk all directories,
-	 * stat every entry, and attempt to read regular files.
-	 * This triggers dirent and inode parsing for the entire tree.
-	 */
 	DIR *dir;
 	struct dirent *entry;
 	char child[512];
 	struct stat st;
-	int fd;
-	char buf[4096];
-	ssize_t n;
 
 	dir = opendir(path);
 	if (!dir) {
-		perror(path);
+		printf("EROFS_ORACLE phase=readdir status=rejected path=%s errno=%d\n",
+		       path, errno);
+		stats->failed = 1;
 		return;
 	}
 
 	while ((entry = readdir(dir)) != NULL) {
+		int length;
+
 		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
 			continue;
 
-		snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
-
-		/* stat triggers inode lookup */
-		if (lstat(child, &st) < 0) {
-			printf("lstat failed: %s (%s)\n", child, strerror(errno));
+		length = snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+		if (length < 0 || (size_t)length >= sizeof(child)) {
+			printf("EROFS_ORACLE phase=traverse status=resource_exhausted reason=path_limit\n");
+			stats->failed = 1;
 			continue;
 		}
 
+		if (lstat(child, &st) < 0) {
+			printf("EROFS_ORACLE phase=inode status=rejected path=%s errno=%d\n",
+			       child, errno);
+			stats->failed = 1;
+			continue;
+		}
+		stats->nodes++;
+
 		if (S_ISDIR(st.st_mode)) {
-			traverse_all(child);
+			traverse_all(child, stats);
 		} else if (S_ISREG(st.st_mode)) {
-			/* Try to open and read the file */
-			fd = open(child, O_RDONLY);
+			char buf[4096];
+			ssize_t n;
+			int fd = open(child, O_RDONLY);
+
 			if (fd < 0) {
-				printf("open failed: %s (%s)\n", child, strerror(errno));
-			} else {
-				n = read(fd, buf, sizeof(buf));
-				if (n < 0)
-					printf("read failed: %s (%s)\n", child, strerror(errno));
-				else
-					printf("read ok: %s (%zd bytes)\n", child, n);
-				close(fd);
+				printf("EROFS_ORACLE phase=read_data status=rejected path=%s errno=%d\n",
+				       child, errno);
+				stats->failed = 1;
+				continue;
 			}
+			stats->regular_files++;
+			while ((n = read(fd, buf, sizeof(buf))) > 0)
+				stats->bytes_read += (unsigned long long)n;
+			if (n < 0) {
+				printf("EROFS_ORACLE phase=read_data status=rejected path=%s errno=%d\n",
+				       child, errno);
+				stats->failed = 1;
+			}
+			close(fd);
 		} else if (S_ISLNK(st.st_mode)) {
 			char linkbuf[256];
-			ssize_t linklen = readlink(child, linkbuf, sizeof(linkbuf) - 1);
-			if (linklen < 0)
-				printf("readlink failed: %s (%s)\n", child, strerror(errno));
-			else
-				printf("readlink ok: %s -> %.*s\n", child, (int)linklen, linkbuf);
-		} else {
-			printf("special file: %s (mode=%o)\n", child, st.st_mode);
+
+			stats->symlinks++;
+			if (readlink(child, linkbuf, sizeof(linkbuf)) < 0) {
+				printf("EROFS_ORACLE phase=read_data status=rejected path=%s errno=%d\n",
+				       child, errno);
+				stats->failed = 1;
+			}
 		}
 	}
 
@@ -180,6 +198,7 @@ static const char *wait_for_erofs_disk(void)
 
 int main(void)
 {
+	struct traversal_stats stats = { 0 };
 	int rc;
 	const char *disk;
 
@@ -196,8 +215,7 @@ int main(void)
 	mount("debugfs", "/sys/kernel/debug", "debugfs", 0, "");
 	mknod("/dev/console", S_IFCHR | 0600, makedev(5, 1));
 
-	puts("\n=== EROFS QEMU smoke boot ===");
-	puts("Kernel command line:");
+	puts("EROFS_ORACLE phase=boot status=started");
 	show_file("/proc/cmdline");
 	disk = wait_for_erofs_disk();
 	printf("\n\nAttempting to mount %s as EROFS at /mnt/erofs ...\n", disk);
@@ -209,29 +227,18 @@ int main(void)
 		 * The security goal is: the kernel rejects cleanly,
 		 * without panic, KASAN, or information leak.
 		 */
-		puts("== erofs mount rejected safely ==");
-		puts("Mount failed as expected for malformed image.");
-		puts("Checking dmesg for suspicious kernel messages...");
-		if (access("/proc/sys/kernel/debug/tracing/trace", R_OK) == 0)
-			show_file("/proc/sys/kernel/debug/tracing/trace");
+		printf("EROFS_ORACLE phase=mount status=rejected errno=%d\n", errno);
 		reboot(RB_POWER_OFF);
 		return 0;
 	}
 
-	puts("== erofs qemu booted ==");
-	puts("Mounted EROFS successfully. Contents:");
-	list_files("/mnt/erofs", 3);
-	puts("\n--- Aggressive traversal (stat + read all files) ---");
-	traverse_all("/mnt/erofs");
-	puts("== erofs traversal complete ==");
-	puts("\n/mnt/erofs/demo/hello.txt:");
-	show_file("/mnt/erofs/demo/hello.txt");
-	puts("\n\nDropping to an idle loop. Press Ctrl+A then X to quit QEMU.");
-
-	while (1) {
-		int status;
-		pid_t pid = waitpid(-1, &status, WNOHANG);
-		(void)pid;
-		sleep(3600);
-	}
+	puts("EROFS_ORACLE phase=mount status=accepted");
+	traverse_all("/mnt/erofs", &stats);
+	printf("EROFS_ORACLE phase=traverse status=%s nodes=%lu regular_files=%lu symlinks=%lu bytes_read=%llu\n",
+	       stats.failed ? "rejected" : "accepted", stats.nodes,
+	       stats.regular_files, stats.symlinks, stats.bytes_read);
+	if (!stats.failed)
+		puts("EROFS_ORACLE phase=complete status=accepted");
+	reboot(RB_POWER_OFF);
+	return stats.failed ? 1 : 0;
 }
