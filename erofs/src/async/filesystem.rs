@@ -1,5 +1,5 @@
-use alloc::format;
-use alloc::vec::Vec;
+use std::format;
+use std::vec::Vec;
 use typed_path::Component;
 
 use bytes::Buf;

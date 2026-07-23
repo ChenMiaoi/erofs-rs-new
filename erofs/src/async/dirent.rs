@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use std::vec::Vec;
 use typed_path::{UnixPath, UnixPathBuf};
 
 use super::EroFS;

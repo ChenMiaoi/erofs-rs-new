@@ -1,4 +1,4 @@
-use alloc::{format, string::ToString};
+use std::{format, string::ToString};
 
 use binrw::BinRead;
 use binrw::BinReaderExt;
@@ -242,7 +242,12 @@ mod tests {
         }
     }
 
-    fn make_compact_inode(layout: Layout, data_size: u32, xattr_count: u16, inode_data: u32) -> Inode {
+    fn make_compact_inode(
+        layout: Layout,
+        data_size: u32,
+        xattr_count: u16,
+        inode_data: u32,
+    ) -> Inode {
         let format = (layout as u16) << 1;
         let inode = InodeCompact {
             format,
@@ -269,7 +274,10 @@ mod tests {
         assert_eq!(inode.xattr_size(), size_of::<XattrHeader>());
 
         let inode = make_compact_inode(Layout::FlatInline, 0, 2, 0);
-        assert_eq!(inode.xattr_size(), size_of::<XattrHeader>() + size_of::<XattrEntry>());
+        assert_eq!(
+            inode.xattr_size(),
+            size_of::<XattrHeader>() + size_of::<XattrEntry>()
+        );
     }
 
     #[test]

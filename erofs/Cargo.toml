@@ -16,22 +16,16 @@ workspace = true
 
 [features]
 default = ["std"]
-std = [
-  "dep:memmap2",
-  "thiserror/std",
-  "bytes/std",
-  "binrw/std",
-  "rustix/std",
-  "typed-path/std",
-]
+std = []
 opendal = ["dep:opendal"]
 
 [dependencies]
-binrw = { workspace = true }
+binrw = { workspace = true, default-features = true }
 bitflags = { workspace = true }
-bytes = { workspace = true }
-memmap2 = { workspace = true, default-features = true, optional = true }
+bytes = { workspace = true, default-features = true }
+erofs-format = { version = "0.1.0", path = "../erofs-format" }
+memmap2 = { workspace = true, default-features = true }
 opendal = { workspace = true, optional = true }
-rustix = { workspace = true, features = ["fs"] }
-thiserror = { workspace = true }
-typed-path = { workspace = true }
+rustix = { workspace = true, features = ["fs", "std"] }
+thiserror = { workspace = true, default-features = true }
+typed-path = { workspace = true, default-features = true }

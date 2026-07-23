@@ -3,15 +3,15 @@
 //! This module provides a unified interface for accessing EROFS image data
 //! from different sources:
 //!
-//! - [`MmapImage`]: Memory-mapped files (requires `std` feature)
-//! - [`SliceImage`]: Raw byte slices (available in `no_std` mode)
+//! - [`MmapImage`]: Memory-mapped files
+//! - [`SliceImage`]: Borrowed images that are already in memory
 //!
 //! The [`Image`] trait defines the common interface that all backend implementations
 //! must implement.
 //!
 //! # Examples
 //!
-//! ## Using mmap backend (std)
+//! ## Using mmap
 //!
 //! ```no_run
 //! use erofs_rs::{EroFS, backend::MmapImage};
@@ -23,7 +23,7 @@
 //! # }
 //! ```
 //!
-//! ## Using slice backend (no_std)
+//! ## Using a borrowed byte slice
 //!
 //! ```no_run
 //! use erofs_rs::{EroFS, backend::SliceImage};
@@ -37,14 +37,12 @@ use core::{future::Future, ops};
 
 use super::Result;
 
-#[cfg(feature = "std")]
 mod mmap;
-#[cfg(feature = "std")]
 pub use mmap::MmapImage;
 
-#[cfg(all(feature = "std", feature = "opendal"))]
+#[cfg(feature = "opendal")]
 mod opendal;
-#[cfg(all(feature = "std", feature = "opendal"))]
+#[cfg(feature = "opendal")]
 pub use opendal::OpendalImage;
 
 mod slice;

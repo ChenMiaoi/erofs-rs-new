@@ -1,7 +1,5 @@
 use std::io::Read;
 
-use alloc::string::String;
-
 use opendal::{Operator, options::ReadOptions, raw::BytesRange};
 
 use super::AsyncImage;

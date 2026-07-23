@@ -1,19 +1,31 @@
 # erofs-rs
 
-A pure Rust library for reading and building [EROFS](https://docs.kernel.org/filesystems/erofs.html) (Enhanced Read-Only File System) images.
+A pure Rust library for reading [EROFS](https://docs.kernel.org/filesystems/erofs.html) (Enhanced Read-Only File System) images.
 
-> **Note**: This library aims to provide essential parsing and building capabilities for common use cases, not a full reimplementation of [erofs-utils](https://github.com/erofs/erofs-utils).
+For implementation coverage, the pinned Linux EROFS disk ABI, and fuzzing and injection field registration, see the compiled schema exposed by `erofs-cli field list --schema`.
+
+> **Note**: This library aims to provide essential parsing and inspection capabilities for common use cases, not a full reimplementation of [erofs-utils](https://github.com/erofs/erofs-utils).
 
 ## Features
 
-- **no_std support** with `alloc` for embedded systems
-- Zero-copy parsing via mmap (std) or byte slices (no_std)
+- A dedicated `no_std` format crate for endian decoding and checked image offsets
+- Zero-copy reader backends using mmap or borrowed byte slices
 - Directory traversal and file reading
 - Multiple data layouts: flat plain, flat inline, chunk-based
 
+## Vendor Linux boot environment
+
+The repository pins `vendor/linux` and `vendor/erofs-utils` submodules. Build a `mkfs.erofs` image and boot Linux under QEMU with:
+
+```bash
+git submodule update --init --depth 1
+make all
+make run
+```
+
 ## Usage
 
-### Standard (with std)
+### High-level reader
 
 ```rust
 use std::io::Read;
@@ -37,53 +49,40 @@ fn main() -> erofs_rs::Result<()> {
 }
 ```
 
-### no_std (with alloc)
+### Low-level `no_std` format primitives
+
+The high-level `erofs-rs` reader is intentionally `std`-only. OS-independent
+on-disk decoding and checked `u64` image offsets live in the separate
+`erofs-format` crate, which has no default features and forbids unsafe code.
 
 ```rust
-#![no_std]
+use erofs_format::{ReadAt, SliceReader, Span, primary_inode_offset};
 
-extern crate alloc;
-use erofs_rs::{EroFS, backend::SliceImage};
-
-fn main() -> erofs_rs::Result<()> {
-    // Assuming you have the EROFS image data in memory
-    let image_data: &'static [u8] = include_bytes!("system.erofs");
-    let fs = EroFS::new(SliceImage::new(image_data))?;
-
-    // List directory entries
-    for entry in fs.read_dir("/etc")? {
-        let entry = entry?;
-        // Process directory entry...
-    }
-
-    // Walk directory tree
-    for entry in fs.walk_dir("/")? {
-        let entry = entry?;
-        // Process each file/directory...
-    }
-
-    Ok(())
-}
+let image = SliceReader::new(include_bytes!("system.erofs"));
+let inode_offset = primary_inode_offset(1, 12, 36)?;
+let mut inode_header = [0; 2];
+image.read_exact_at(inode_offset, &mut inode_header)?;
+assert!(Span::new(inode_offset, 2)?.is_within(image.len()));
+# Ok::<(), erofs_format::Error>(())
 ```
 
 ## Feature Flags
 
-- `std` (default): Enables standard library support, including mmap backend
+- `std` (default): Compatibility feature retained for existing 0.2.x dependents; the high-level reader is always std-only
 - `opendal`: Enables async I/O via [Apache OpenDAL](https://opendal.apache.org/), supporting remote backends (HTTP, S3, etc.)
-- Without `std`: Operates in `no_std` mode with `alloc`
 
 ```toml
-# Standard usage (default)
+# High-level reader
 [dependencies]
-erofs-rs = "0.1"
+erofs-rs = "0.2.1"
 
-# Async with OpenDAL
+# Async reader with OpenDAL
 [dependencies]
-erofs-rs = { version = "0.1", features = ["opendal"] }
+erofs-rs = { version = "0.2.1", features = ["opendal"] }
 
-# no_std with alloc
+# Low-level no_std format primitives
 [dependencies]
-erofs-rs = { version = "0.1", default-features = false }
+erofs-format = "0.1.0"
 ```
 
 ## CLI
@@ -112,8 +111,8 @@ erofs-cli inspect -i http://example.com/images/system.erofs cat /etc/os-release
 ### Implemented
 
 - [x] Superblock / inode / dirent parsing
-- [x] Flat plain layout
-- [x] Flat inline layout
+- [x] Flat plain layout (basic path; multi-block reads have a known limitation)
+- [x] Flat inline layout (basic path; exact-block-size tails have a known limitation)
 - [x] Chunk-based layout (without chunk indexes)
 - [x] Directory walk (`walk_dir`)
 - [x] Convert to tar archive

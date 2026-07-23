@@ -3,9 +3,8 @@ use core::ops;
 
 /// A byte slice backend for EROFS images.
 ///
-/// This backend wraps a byte slice, making it suitable for `no_std` environments
-/// or when the image data is already in memory. It provides zero-copy access
-/// to the image data.
+/// This backend wraps a byte slice for images that are already in memory. It
+/// provides zero-copy access without imposing a filesystem backend.
 ///
 /// # Examples
 ///

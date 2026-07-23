@@ -1,5 +1,5 @@
-use alloc::{format, string::ToString, sync::Arc};
 use bytes::Buf;
+use std::{format, string::ToString, sync::Arc};
 use typed_path::Component;
 use typed_path::{UnixComponent, UnixPath};
 
@@ -14,8 +14,7 @@ use crate::{Error, Result};
 /// The main entry point for reading EROFS filesystem images.
 ///
 /// `EroFS` provides methods to traverse directories, open files, and access
-/// filesystem metadata from EROFS images. It supports both standard (mmap-based)
-/// and no_std (slice-based) backends.
+/// filesystem metadata from memory-mapped or borrowed in-memory images.
 ///
 /// # Examples
 ///
@@ -33,16 +32,14 @@ use crate::{Error, Result};
 /// file.read_to_string(&mut content).unwrap();
 /// ```
 ///
-/// ## no_std usage with byte slice
+/// ## Using a borrowed byte slice
 ///
 /// ```no_run
-/// # extern crate alloc;
 /// use erofs_rs::{EroFS, backend::SliceImage};
 ///
 /// let image_data: &'static [u8] = &[/* EROFS image data */];
 /// let fs = EroFS::new(SliceImage::new(image_data)).unwrap();
 ///
-/// // Traverse directories
 /// for entry in fs.read_dir("/etc").unwrap() {
 ///     let entry = entry.unwrap();
 ///     // Process directory entry...
@@ -58,8 +55,7 @@ impl<I: Image> EroFS<I> {
     /// Creates a new `EroFS` instance from a backend image source.
     ///
     /// The backend can be either a memory-mapped file ([`MmapImage`](crate::backend::MmapImage))
-    /// in std environments, or a byte slice ([`SliceImage`](crate::backend::SliceImage)) in
-    /// no_std environments.
+    /// or an image already available as a byte slice ([`SliceImage`](crate::backend::SliceImage)).
     ///
     /// # Errors
     ///

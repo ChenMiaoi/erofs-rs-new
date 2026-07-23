@@ -1,5 +1,5 @@
 [workspace]
-members = ["erofs", "erofs-cli"]
+members = ["erofs-format", "erofs", "erofs-cli"]
 resolver = "2"
 
 [workspace.lints.clippy]

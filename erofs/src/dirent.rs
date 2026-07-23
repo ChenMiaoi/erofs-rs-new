@@ -1,5 +1,5 @@
-use alloc::string::{String, ToString};
 use core::{cmp, hint};
+use std::string::{String, ToString};
 
 use binrw::{BinRead, io::Cursor};
 use typed_path::UnixPathBuf;

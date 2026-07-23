@@ -1,4 +1,4 @@
-use alloc::string::String;
+use std::string::String;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -36,7 +36,6 @@ pub enum Error {
     #[error("corrupted data: {0}")]
     CorruptedData(String),
 
-    #[cfg(feature = "std")]
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -45,4 +44,4 @@ pub enum Error {
     Opendal(#[from] opendal::Error),
 }
 
-pub type Result<T> = core::result::Result<T, Error>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;

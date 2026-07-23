@@ -1,0 +1,14 @@
+[package]
+name = "erofs-format"
+version = "0.1.0"
+edition = "2024"
+authors = ["Dreamacro"]
+description = "Low-level, no_std EROFS on-disk format primitives"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Dreamacro/erofs-rs"
+keywords = ["erofs", "filesystem", "no-std"]
+categories = ["filesystem", "no-std"]
+rust-version = "1.89"
+
+[lints]
+workspace = true

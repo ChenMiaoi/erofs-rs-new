@@ -1,23 +1,13 @@
-#[cfg(feature = "std")]
 use std::{
     cmp, format,
     io::{Read, Result},
 };
-
-#[cfg(not(feature = "std"))]
-use crate::Result;
 
 use bytes::Bytes;
 
 use super::EroFS;
 use crate::backend::Image;
 use crate::types::Inode;
-
-#[cfg(not(feature = "std"))]
-/// A trait for reading file contents in `no_std` mode.
-pub trait Read {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
-}
 
 /// A handle to a file within an EROFS filesystem.
 ///
@@ -84,11 +74,7 @@ impl<'a, I: Image> Read for File<'a, I> {
         let cur_offset = self.offset;
         let block = self.erofs.get_inode_block(&self.inode, cur_offset);
 
-        #[cfg(feature = "std")]
-        let block =
-            block.map_err(|e| std::io::Error::other(format!("read block failed: {}", e)))?;
-        #[cfg(not(feature = "std"))]
-        let block = block.map_err(|e| e)?;
+        let block = block.map_err(|e| std::io::Error::other(format!("read block failed: {e}")))?;
 
         if buf.len() >= block.len() {
             let n = block.len();

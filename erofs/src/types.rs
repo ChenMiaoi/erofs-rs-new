@@ -1,4 +1,3 @@
-#[cfg(feature = "std")]
 use std::{
     fs::Permissions,
     os::unix::fs::PermissionsExt,
@@ -6,18 +5,16 @@ use std::{
 };
 
 use binrw::BinRead;
+pub use erofs_format::{
+    CHUNK_FORMAT_BLKBITS_MASK as LAYOUT_CHUNK_FORMAT_BITS,
+    CHUNK_FORMAT_INDEXES as LAYOUT_CHUNK_FORMAT_INDEXES, SUPERBLOCK_MAGIC as MAGIC_NUMBER,
+};
 use rustix::fs::FileType;
 
 use crate::Error;
 
-pub const MAGIC_NUMBER: u32 = 0xe0f5e1e2;
-pub const SUPER_BLOCK_OFFSET: usize = 1024;
-
-pub const LAYOUT_CHUNK_FORMAT_BITS: u16 = 0x001F;
-pub const LAYOUT_CHUNK_FORMAT_INDEXES: u16 = 0x0020;
-
-pub const SB_EXTSLOT_SIZE: usize = 16;
-
+pub const SUPER_BLOCK_OFFSET: usize = erofs_format::SUPERBLOCK_OFFSET as usize;
+pub const SB_EXTSLOT_SIZE: usize = erofs_format::SUPERBLOCK_EXTSLOT_SIZE as usize;
 #[repr(C)]
 #[derive(Debug, Clone, Copy, BinRead)]
 #[br(little)]
@@ -211,7 +208,6 @@ impl Inode {
         self.file_type().is_symlink()
     }
 
-    #[cfg(feature = "std")]
     pub fn permissions(&self) -> Permissions {
         match self {
             Self::Compact((_, n)) => Permissions::from_mode(n.mode.into()),
@@ -219,15 +215,6 @@ impl Inode {
         }
     }
 
-    #[cfg(not(feature = "std"))]
-    pub fn permissions(&self) -> u16 {
-        match self {
-            Self::Compact((_, n)) => n.mode,
-            Self::Extended((_, n)) => n.mode,
-        }
-    }
-
-    #[cfg(feature = "std")]
     pub fn modified(&self) -> Option<SystemTime> {
         match self {
             Self::Compact((_, _)) => None,
@@ -239,18 +226,6 @@ impl Inode {
                         + Duration::from_secs(secs)
                         + Duration::from_nanos(nanos as u64),
                 )
-            }
-        }
-    }
-
-    #[cfg(not(feature = "std"))]
-    pub fn modified(&self) -> Option<(u64, u32)> {
-        match self {
-            Self::Compact((_, _)) => None,
-            Self::Extended((_, n)) => {
-                let secs = n.mtime;
-                let nanos = n.mtime_ns;
-                Some((secs, nanos))
             }
         }
     }

@@ -5,11 +5,9 @@
 //!
 //! # Features
 //!
-//! - **no_std support**: Can be used in embedded systems with `alloc`
-//! - **Zero-copy parsing**: Via mmap (std) or byte slices (no_std)
-//! - **Multiple backends**: Memory-mapped files (std) or raw byte slices (no_std)
+//! - **Zero-copy parsing**: Via memory maps or borrowed byte slices
+//! - **Multiple backends**: Memory-mapped files, byte slices, and optional OpenDAL
 //! - **Multiple layouts**: Flat plain, flat inline, and chunk-based data layouts
-//!
 //! # Examples
 //!
 //! ## Standard usage (with std)
@@ -27,29 +25,9 @@
 //! file.read_to_string(&mut content).unwrap();
 //! ```
 //!
-//! ## no_std usage (with alloc)
-//!
-//! ```no_run
-//! # extern crate alloc;
-//! use erofs_rs::{EroFS, backend::SliceImage};
-//!
-//! // Assuming you have the EROFS image data in memory
-//! let image_data: &'static [u8] = &[/* ... */];
-//! let fs = EroFS::new(SliceImage::new(image_data)).unwrap();
-//!
-//! // List directory entries
-//! for entry in fs.read_dir("/etc").unwrap() {
-//!     let entry = entry.unwrap();
-//!     // Process directory entry...
-//! }
-//! ```
-#![no_std]
-
-#[macro_use]
-extern crate alloc;
-
-#[cfg(feature = "std")]
-extern crate std;
+//! For OS-independent on-disk decoding and checked image offsets, use the
+//! companion `erofs-format` crate. This high-level reader intentionally uses
+//! the standard library for filesystem-facing APIs.
 
 pub(crate) mod dirent;
 pub(crate) mod filesystem;
