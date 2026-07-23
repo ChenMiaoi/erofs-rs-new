@@ -96,9 +96,9 @@ impl EroFSCore {
                     return Err(Error::OutOfRange(block_index, block_count));
                 }
 
-                let size = inode.data_size();
-                let offset = self.block_offset(inode.raw_block_addr()) as usize
-                    + (block_index * self.block_size);
+                let file_offset = block_index * self.block_size;
+                let size = (inode.data_size() - file_offset).min(self.block_size);
+                let offset = self.block_offset(inode.raw_block_addr()) as usize + file_offset;
                 Ok(BlockPlan::Direct { offset, size })
             }
             Layout::FlatInline => {
@@ -108,21 +108,20 @@ impl EroFSCore {
                     return Err(Error::OutOfRange(block_index, block_count));
                 }
 
-                if block_count != 0 && block_index == block_count - 1 {
-                    // tail block
+                let tail_size = inode.data_size() % self.block_size;
+                if tail_size != 0 && block_index == block_count - 1 {
                     let inode_offset = self.get_inode_offset(inode.id());
-                    let buf_size = inode.data_size() % self.block_size;
                     let offset = inode_offset as usize + inode.size() + inode.xattr_size();
                     return Ok(BlockPlan::Direct {
                         offset,
-                        size: buf_size,
+                        size: tail_size,
                     });
                 }
 
-                let offset = self.block_offset(inode.raw_block_addr()) as usize
-                    + (block_index * self.block_size);
-                let len = self.block_size.min(inode.data_size());
-                Ok(BlockPlan::Direct { offset, size: len })
+                let file_offset = block_index * self.block_size;
+                let offset = self.block_offset(inode.raw_block_addr()) as usize + file_offset;
+                let size = (inode.data_size() - file_offset).min(self.block_size);
+                Ok(BlockPlan::Direct { offset, size })
             }
             Layout::CompressedFull | Layout::CompressedCompact => {
                 Err(Error::NotSupported("compressed compact layout".to_string()))
@@ -294,5 +293,33 @@ mod tests {
             }
             _ => panic!("expected chunked plan"),
         }
+    }
+
+    #[test]
+    fn flat_plain_reads_one_bounded_block_at_a_time() {
+        let core = make_core();
+        let inode = make_compact_inode(Layout::FlatPlain, (core.block_size + 17) as u32, 0, 7);
+
+        assert!(matches!(
+            core.plan_inode_block_read(&inode, 0).unwrap(),
+            BlockPlan::Direct { size, .. } if size == core.block_size
+        ));
+        assert!(matches!(
+            core.plan_inode_block_read(&inode, core.block_size).unwrap(),
+            BlockPlan::Direct { size: 17, .. }
+        ));
+    }
+
+    #[test]
+    fn flat_inline_exact_block_uses_data_block() {
+        let core = make_core();
+        let inode = make_compact_inode(Layout::FlatInline, core.block_size as u32, 0, 7);
+        let data_offset = core.block_offset(7) as usize;
+
+        assert!(matches!(
+            core.plan_inode_block_read(&inode, 0).unwrap(),
+            BlockPlan::Direct { offset, size }
+                if offset == data_offset && size == core.block_size
+        ));
     }
 }

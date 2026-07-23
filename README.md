@@ -111,8 +111,8 @@ erofs-cli inspect -i http://example.com/images/system.erofs cat /etc/os-release
 ### Implemented
 
 - [x] Superblock / inode / dirent parsing
-- [x] Flat plain layout (basic path; multi-block reads have a known limitation)
-- [x] Flat inline layout (basic path; exact-block-size tails have a known limitation)
+- [x] Flat plain layout, including bounded multi-block reads
+- [x] Flat inline layout, including exact-block-size files
 - [x] Chunk-based layout (without chunk indexes)
 - [x] Directory walk (`walk_dir`)
 - [x] Convert to tar archive
