@@ -130,6 +130,20 @@ impl<I: Image> EroFS<I> {
         Ok(File::new(inode, self))
     }
 
+    /// Opens regular-file or symlink inode data for oracle traversal.
+    ///
+    /// Unlike [`Self::open_inode_file`], this accepts symlinks so callers can
+    /// consume their target bytes to EOF without interpreting the path.
+    pub fn open_inode_data(&self, inode: Inode) -> Result<File<'_, I>> {
+        if !inode.is_file() && !inode.is_symlink() {
+            return Err(Error::NotAFile(format!(
+                "inode {} has no readable file payload",
+                inode.id()
+            )));
+        }
+        Ok(File::new(inode, self))
+    }
+
     /// Returns a reference to the filesystem superblock.
     pub fn super_block(&self) -> &SuperBlock {
         &self.core.super_block
