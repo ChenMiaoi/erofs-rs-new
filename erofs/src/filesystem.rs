@@ -7,6 +7,9 @@ use binrw::io::Cursor;
 use crate::types::*;
 use crate::{Error, Result};
 
+const ALL_INCOMPAT_FEATURES: u32 = 0x0000_01ff;
+const SUPPORTED_INCOMPAT_FEATURES: u32 = 0x0000_0005;
+
 /// Shared core data and pure computation logic for EROFS filesystem.
 ///
 /// This struct is used by both sync and async `EroFS` implementations
@@ -51,6 +54,20 @@ impl EroFSCore {
             return Err(Error::InvalidSuperblock(format!(
                 "invalid magic number: 0x{:x}",
                 magic_number
+            )));
+        }
+
+        let unknown_features = super_block.feature_incompat & !ALL_INCOMPAT_FEATURES;
+        if unknown_features != 0 {
+            return Err(Error::InvalidSuperblock(format!(
+                "unknown incompatible feature bits: 0x{unknown_features:08x}"
+            )));
+        }
+
+        let unsupported_features = super_block.feature_incompat & !SUPPORTED_INCOMPAT_FEATURES;
+        if unsupported_features != 0 {
+            return Err(Error::NotSupported(format!(
+                "incompatible feature bits: 0x{unsupported_features:08x}"
             )));
         }
 
@@ -296,6 +313,14 @@ mod tests {
         }
     }
 
+    fn superblock_bytes(feature_incompat: u32) -> [u8; SuperBlock::size()] {
+        let mut bytes = [0; SuperBlock::size()];
+        bytes[..4].copy_from_slice(&MAGIC_NUMBER.to_le_bytes());
+        bytes[12] = 12;
+        bytes[80..84].copy_from_slice(&feature_incompat.to_le_bytes());
+        bytes
+    }
+
     fn make_compact_inode(
         layout: Layout,
         data_size: u32,
@@ -317,6 +342,27 @@ mod tests {
             reserved2: 0,
         };
         Inode::Compact((1, inode))
+    }
+
+    #[test]
+    fn rejects_unknown_incompatible_features() {
+        assert!(matches!(
+            EroFSCore::new(&superblock_bytes(0x8000_0000)),
+            Err(Error::InvalidSuperblock(message)) if message == "unknown incompatible feature bits: 0x80000000"
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_incompatible_features() {
+        assert!(matches!(
+            EroFSCore::new(&superblock_bytes(0x0000_0080)),
+            Err(Error::NotSupported(message)) if message == "incompatible feature bits: 0x00000080"
+        ));
+    }
+
+    #[test]
+    fn accepts_supported_incompatible_features() {
+        assert!(EroFSCore::new(&superblock_bytes(0x0000_0005)).is_ok());
     }
 
     #[test]
