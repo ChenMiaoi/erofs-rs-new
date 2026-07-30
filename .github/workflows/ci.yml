@@ -4,21 +4,37 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  rust:
+  check:
+    name: Check
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: true
+          persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: 1.89.0
-          components: clippy
+          components: clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@v2
 
       - run: cargo fmt --all --check
       - run: cargo check -p erofs-format --no-default-features --locked
+      - run: cargo check -p erofs-rs --features opendal --locked
       - run: cc -std=c11 -Wall -Wextra -Werror -o /tmp/erofs-layout-probe scripts/erofs-layout-probe.c
       - run: /tmp/erofs-layout-probe
       - run: cargo build --workspace --all-targets --locked
@@ -26,11 +42,14 @@ jobs:
       - run: cargo test --workspace --locked
 
   coverage:
+    name: Coverage
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: true
+          persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -46,3 +65,5 @@ jobs:
         with:
           name: lcov
           path: target/lcov.info
+          if-no-files-found: error
+          retention-days: 14
