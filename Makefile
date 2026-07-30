@@ -35,7 +35,7 @@ QEMU_ARGS := \
 	-initrd $(INITRAMFS) \
 	-append "$(KERNEL_CMDLINE)"
 
-.PHONY: all apt-deps deps-check kernel-config kernel erofs-utils initramfs erofs-image run smoke oracle clean distclean help
+.PHONY: all apt-deps deps-check kernel-config kernel erofs-utils initramfs erofs-image run smoke oracle coverage clean distclean help
 
 all: kernel initramfs erofs-image
 
@@ -52,6 +52,7 @@ help:
 		'  make run            Build everything and boot vendor Linux in QEMU' \
 		'  make smoke          Boot with a timeout and verify mount plus traversal' \
 		'  make oracle SAMPLE=x Boot an arbitrary read-only EROFS sample' \
+		'  make coverage       Generate target/lcov.info with cargo-llvm-cov' \
 		'  make clean          Remove generated build artifacts'
 
 apt-deps:
@@ -138,6 +139,9 @@ smoke: all
 	classify_dmesg "$(BUILD)/qemu-smoke.log" "$$qemu_rc"; \
 	echo "$$REPLAY_RESULT: $$REPLAY_MSG"; \
 	if [ "$$REPLAY_RESULT" != "ACCEPTED" ]; then exit 1; fi
+
+coverage:
+	cargo llvm-cov --workspace --all-features --lcov --output-path target/lcov.info
 
 clean:
 	rm -rf $(BUILD)

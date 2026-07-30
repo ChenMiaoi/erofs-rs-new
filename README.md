@@ -191,6 +191,17 @@ Minimization removes intent groups first, then shrinks field values, bit sets,
 raw patches, and truncate deltas. Every candidate regenerates integrity repair
 and must reproduce the same signature repeatedly in the same profile.
 
+## Coverage
+
+Install [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov), then generate an LCOV report for the full workspace and enabled features:
+
+```bash
+cargo install cargo-llvm-cov --locked
+make coverage
+```
+
+The report is written to `target/lcov.info`. CI uploads the same report as the `lcov` artifact; it records coverage only and does not impose a line-coverage threshold. Metadata acceptance is enforced separately by locator schema-matrix tests.
+
 ## Status
 
 ### Implemented
