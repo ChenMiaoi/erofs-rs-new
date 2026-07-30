@@ -215,6 +215,16 @@ pub struct PublishedCampaign {
     pub result: CampaignReport,
 }
 
+/// Incremental campaign state emitted after every completed case.
+#[derive(Clone, Debug)]
+pub struct CampaignProgress<'a> {
+    pub total_cases: usize,
+    pub completed_cases: usize,
+    pub samples_materialized: u64,
+    pub oracle_runs: u64,
+    pub current_case: &'a CampaignCaseReport,
+}
+
 /// Result of signature-preserving minimization.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -286,6 +296,21 @@ pub fn run_campaign(
     oracle_paths: Option<&OraclePaths>,
     limits: ResourceLimits,
 ) -> Result<PublishedCampaign, Error> {
+    run_campaign_with_progress(parent_path, corpus, spec, oracle_paths, limits, |_| {})
+}
+
+/// Runs a campaign and reports completed-case statistics synchronously.
+pub fn run_campaign_with_progress<F>(
+    parent_path: &Path,
+    corpus: &Path,
+    spec: CampaignSpec,
+    oracle_paths: Option<&OraclePaths>,
+    limits: ResourceLimits,
+    mut progress: F,
+) -> Result<PublishedCampaign, Error>
+where
+    F: FnMut(CampaignProgress<'_>),
+{
     let parent = fs::read(parent_path)?;
     let recipe = generate_recipe(&parent, spec)?;
     let campaign_id = sha256(&serde_json::to_vec(&recipe)?);
@@ -300,6 +325,7 @@ pub fn run_campaign(
     let mut materialized = 0_u64;
     let mut reports = Vec::new();
     let mut stopped_reason = "completed".to_string();
+    let total_cases = recipe.cases.len();
 
     for case in &recipe.cases {
         if start.elapsed() > Duration::from_millis(recipe.spec.budget.wall_time_ms) {
@@ -319,6 +345,14 @@ pub fn run_campaign(
                     planning_error: Some(error.to_string()),
                     oracle_results: Vec::new(),
                 });
+                let current_case = reports.last().expect("report was just added");
+                progress(CampaignProgress {
+                    total_cases,
+                    completed_cases: reports.len(),
+                    samples_materialized: materialized,
+                    oracle_runs,
+                    current_case,
+                });
                 continue;
             }
         };
@@ -334,6 +368,14 @@ pub fn run_campaign(
                 duplicate_plan,
                 planning_error: None,
                 oracle_results: Vec::new(),
+            });
+            let current_case = reports.last().expect("report was just added");
+            progress(CampaignProgress {
+                total_cases,
+                completed_cases: reports.len(),
+                samples_materialized: materialized,
+                oracle_runs,
+                current_case,
             });
             continue;
         }
@@ -386,6 +428,14 @@ pub fn run_campaign(
             duplicate_plan,
             planning_error: None,
             oracle_results: identities,
+        });
+        let current_case = reports.last().expect("report was just added");
+        progress(CampaignProgress {
+            total_cases,
+            completed_cases: reports.len(),
+            samples_materialized: materialized,
+            oracle_runs,
+            current_case,
         });
         if oracle_runs >= recipe.spec.budget.max_oracle_runs
             && recipe.spec.funnel != FunnelPolicy::MaterializeOnly

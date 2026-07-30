@@ -18,6 +18,7 @@ chrono = { workspace = true, default-features = false, features = [
     "clock",
 ] }
 clap = { workspace = true, default-features = true, features = ["derive"] }
+crossterm = { workspace = true }
 erofs-format = { path = "../erofs-format" }
 erofs-lab = { path = "../erofs-lab" }
 erofs-rs = { path = "../erofs", features = ["opendal"] }

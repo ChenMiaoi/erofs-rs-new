@@ -6,7 +6,7 @@ use erofs_lab::{
     IntegrityPolicy, MutationMode, ObjectRef,
     campaign::{
         CampaignBudget, CampaignSpec, CampaignTarget, FunnelPolicy, MinimizeRequest, minimize_case,
-        run_campaign,
+        run_campaign, run_campaign_with_progress,
     },
     oracle::{OracleProfile, ResourceLimits},
 };
@@ -87,6 +87,9 @@ struct RunArgs {
     max_oracle_runs: u64,
     #[arg(long, default_value_t = 300_000)]
     wall_time_ms: u64,
+    /// Disable the interactive AFL-style dashboard.
+    #[arg(long)]
+    no_tui: bool,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
 }
@@ -147,13 +150,28 @@ fn run(args: RunArgs) -> Result<()> {
     } else {
         Some(oracle_paths(&args.workspace)?)
     };
-    let published = run_campaign(
-        &args.image,
-        &args.output_dir,
-        spec,
-        paths.as_ref(),
-        ResourceLimits::default(),
-    )?;
+    let use_tui = !args.no_tui && crate::dashboard::is_supported();
+    let published = if use_tui {
+        let mut dashboard = crate::dashboard::CampaignDashboard::start()?;
+        run_campaign_with_progress(
+            &args.image,
+            &args.output_dir,
+            spec,
+            paths.as_ref(),
+            ResourceLimits::default(),
+            |progress| {
+                let _ = dashboard.update(progress);
+            },
+        )?
+    } else {
+        run_campaign(
+            &args.image,
+            &args.output_dir,
+            spec,
+            paths.as_ref(),
+            ResourceLimits::default(),
+        )?
+    };
     println!("recipe: {}", published.recipe.display());
     println!("report: {}", published.report.display());
     println!("novelty: {}", published.novelty.display());

@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 
 mod campaign;
 mod convert;
+mod dashboard;
 mod dump;
 mod field;
 mod inject;
