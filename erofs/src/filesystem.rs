@@ -61,7 +61,11 @@ impl EroFSCore {
             )));
         }
 
-        let block_size = 1usize << blk_size_bits;
+        let block_size = 1_usize
+            .checked_shl(u32::from(blk_size_bits))
+            .ok_or_else(|| {
+                Error::InvalidSuperblock("block size exceeds platform limits".to_string())
+            })?;
         Ok(Self {
             super_block,
             block_size,
@@ -90,37 +94,54 @@ impl EroFSCore {
     pub(crate) fn plan_inode_block_read(&self, inode: &Inode, offset: usize) -> Result<BlockPlan> {
         match inode.layout()? {
             Layout::FlatPlain => {
-                let block_count = inode.data_size().div_ceil(self.block_size);
+                let data_size = inode.data_size_checked()?;
+                let block_count = data_size.div_ceil(self.block_size);
                 let block_index = offset / self.block_size;
                 if block_index >= block_count {
                     return Err(Error::OutOfRange(block_index, block_count));
                 }
 
-                let file_offset = block_index * self.block_size;
-                let size = (inode.data_size() - file_offset).min(self.block_size);
-                let offset = self.block_offset(inode.raw_block_addr()) as usize + file_offset;
+                let file_offset = block_index.checked_mul(self.block_size).ok_or_else(|| {
+                    Error::CorruptedData("file block offset overflow".to_string())
+                })?;
+                let size = (data_size - file_offset).min(self.block_size);
+                let offset = self
+                    .block_offset(inode.raw_block_addr())?
+                    .checked_add(file_offset)
+                    .ok_or_else(|| Error::CorruptedData("data offset overflow".to_string()))?;
                 Ok(BlockPlan::Direct { offset, size })
             }
             Layout::FlatInline => {
-                let block_count = inode.data_size().div_ceil(self.block_size);
+                let data_size = inode.data_size_checked()?;
+                let block_count = data_size.div_ceil(self.block_size);
                 let block_index = offset / self.block_size;
                 if block_index >= block_count {
                     return Err(Error::OutOfRange(block_index, block_count));
                 }
 
-                let tail_size = inode.data_size() % self.block_size;
+                let tail_size = data_size % self.block_size;
                 if tail_size != 0 && block_index == block_count - 1 {
-                    let inode_offset = self.get_inode_offset(inode.id());
-                    let offset = inode_offset as usize + inode.size() + inode.xattr_size();
+                    let offset = self
+                        .get_inode_offset(inode.id())?
+                        .checked_add(inode.size())
+                        .and_then(|offset| offset.checked_add(inode.xattr_size()))
+                        .ok_or_else(|| {
+                            Error::CorruptedData("inline data offset overflow".to_string())
+                        })?;
                     return Ok(BlockPlan::Direct {
                         offset,
                         size: tail_size,
                     });
                 }
 
-                let file_offset = block_index * self.block_size;
-                let offset = self.block_offset(inode.raw_block_addr()) as usize + file_offset;
-                let size = (inode.data_size() - file_offset).min(self.block_size);
+                let file_offset = block_index.checked_mul(self.block_size).ok_or_else(|| {
+                    Error::CorruptedData("file block offset overflow".to_string())
+                })?;
+                let offset = self
+                    .block_offset(inode.raw_block_addr())?
+                    .checked_add(file_offset)
+                    .ok_or_else(|| Error::CorruptedData("data offset overflow".to_string()))?;
+                let size = (data_size - file_offset).min(self.block_size);
                 Ok(BlockPlan::Direct { offset, size })
             }
             Layout::CompressedFull | Layout::CompressedCompact => {
@@ -140,23 +161,34 @@ impl EroFSCore {
                 }
 
                 let chunk_bits = chunk_format.chunk_size_bits() + self.super_block.blk_size_bits;
-                let chunk_size = 1usize << chunk_bits;
-                let chunk_count = inode.data_size().div_ceil(chunk_size);
-                let chunk_index = offset >> chunk_bits;
+                let chunk_size = 1_usize.checked_shl(u32::from(chunk_bits)).ok_or_else(|| {
+                    Error::CorruptedData("chunk size exceeds platform limits".to_string())
+                })?;
+                let data_size = inode.data_size_checked()?;
+                let chunk_count = data_size.div_ceil(chunk_size);
+                let chunk_index = offset / chunk_size;
                 let chunk_fixed = offset % chunk_size / self.block_size;
                 if chunk_index >= chunk_count {
                     return Err(Error::OutOfRange(chunk_index, chunk_count));
                 }
 
-                let inode_offset = self.get_inode_offset(inode.id());
-                let addr_offset =
-                    inode_offset as usize + inode.size() + inode.xattr_size() + (chunk_index * 4);
+                let chunk_table_offset = chunk_index.checked_mul(4).ok_or_else(|| {
+                    Error::CorruptedData("chunk index offset overflow".to_string())
+                })?;
+                let addr_offset = self
+                    .get_inode_offset(inode.id())?
+                    .checked_add(inode.size())
+                    .and_then(|offset| offset.checked_add(inode.xattr_size()))
+                    .and_then(|offset| offset.checked_add(chunk_table_offset))
+                    .ok_or_else(|| {
+                        Error::CorruptedData("chunk address offset overflow".to_string())
+                    })?;
 
                 Ok(BlockPlan::Chunked {
                     addr_offset,
                     chunk_fixed,
                     chunk_size,
-                    data_size: inode.data_size(),
+                    data_size,
                     chunk_index,
                 })
             }
@@ -181,7 +213,10 @@ impl EroFSCore {
             ));
         }
 
-        let file_byte_offset = chunk_index * chunk_size + chunk_fixed * self.block_size;
+        let file_byte_offset = chunk_index
+            .checked_mul(chunk_size)
+            .and_then(|offset| offset.checked_add(chunk_fixed.checked_mul(self.block_size)?))
+            .ok_or_else(|| Error::CorruptedData("chunk file offset overflow".to_string()))?;
         let remaining = data_size.saturating_sub(file_byte_offset);
         let read_size = remaining.min(self.block_size);
 
@@ -189,16 +224,36 @@ impl EroFSCore {
             return Err(Error::OutOfRange(file_byte_offset, data_size));
         }
 
-        let offset = self.block_offset(chunk_addr as u32 + chunk_fixed as u32) as usize;
-        Ok((offset, read_size))
+        let block = u32::try_from(chunk_addr)
+            .map_err(|_| Error::CorruptedData("invalid chunk address".to_string()))?
+            .checked_add(
+                u32::try_from(chunk_fixed)
+                    .map_err(|_| Error::CorruptedData("chunk block index overflow".to_string()))?,
+            )
+            .ok_or_else(|| Error::CorruptedData("chunk block address overflow".to_string()))?;
+        Ok((self.block_offset(block)?, read_size))
     }
 
-    pub(crate) fn get_inode_offset(&self, nid: u64) -> u64 {
-        self.block_offset(self.super_block.meta_blk_addr) + (nid * InodeCompact::size() as u64)
+    pub(crate) fn get_inode_offset(&self, nid: u64) -> Result<usize> {
+        let metadata_offset = self.block_offset(self.super_block.meta_blk_addr)?;
+        let inode_offset = nid
+            .checked_mul(InodeCompact::size() as u64)
+            .ok_or_else(|| Error::CorruptedData("inode offset overflow".to_string()))?;
+        let inode_offset = usize::try_from(inode_offset).map_err(|_| {
+            Error::CorruptedData("inode offset exceeds platform limits".to_string())
+        })?;
+        metadata_offset
+            .checked_add(inode_offset)
+            .ok_or_else(|| Error::CorruptedData("inode address overflow".to_string()))
     }
 
-    pub(crate) fn block_offset(&self, block: u32) -> u64 {
-        (block as u64) << self.super_block.blk_size_bits
+    pub(crate) fn block_offset(&self, block: u32) -> Result<usize> {
+        usize::try_from(block)
+            .ok()
+            .and_then(|block| block.checked_shl(u32::from(self.super_block.blk_size_bits)))
+            .ok_or_else(|| {
+                Error::CorruptedData("block address exceeds platform limits".to_string())
+            })
     }
 }
 
@@ -287,7 +342,7 @@ mod tests {
 
         match plan {
             BlockPlan::Chunked { addr_offset, .. } => {
-                let inode_offset = core.get_inode_offset(inode.id()) as usize;
+                let inode_offset = core.get_inode_offset(inode.id()).unwrap();
                 let expected = inode_offset + inode.size() + inode.xattr_size();
                 assert_eq!(addr_offset, expected);
             }
@@ -314,12 +369,32 @@ mod tests {
     fn flat_inline_exact_block_uses_data_block() {
         let core = make_core();
         let inode = make_compact_inode(Layout::FlatInline, core.block_size as u32, 0, 7);
-        let data_offset = core.block_offset(7) as usize;
+        let data_offset = core.block_offset(7).unwrap();
 
         assert!(matches!(
             core.plan_inode_block_read(&inode, 0).unwrap(),
             BlockPlan::Direct { offset, size }
                 if offset == data_offset && size == core.block_size
+        ));
+    }
+
+    #[test]
+    fn rejects_inode_address_overflow() {
+        let core = make_core();
+
+        assert!(matches!(
+            core.get_inode_offset(u64::MAX),
+            Err(Error::CorruptedData(message)) if message == "inode offset overflow"
+        ));
+    }
+
+    #[test]
+    fn rejects_chunk_block_address_overflow() {
+        let core = make_core();
+
+        assert!(matches!(
+            core.resolve_chunk_read(i32::MAX, usize::MAX, 1, 1, 0),
+            Err(Error::CorruptedData(message)) if message == "chunk file offset overflow"
         ));
     }
 }

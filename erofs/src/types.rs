@@ -163,6 +163,16 @@ impl Inode {
         }
     }
 
+    #[inline]
+    pub fn data_size_checked(&self) -> Result<usize, Error> {
+        let size = match self {
+            Self::Compact((_, n)) => u64::from(n.size),
+            Self::Extended((_, n)) => n.size,
+        };
+        usize::try_from(size)
+            .map_err(|_| Error::CorruptedData("file size exceeds platform limits".to_string()))
+    }
+
     pub fn raw_block_addr(&self) -> u32 {
         match self {
             Self::Compact((_, n)) => n.inode_data,

@@ -84,7 +84,7 @@ impl<I: AsyncImage> EroFS<I> {
     }
 
     pub async fn get_inode(&self, nid: u64) -> Result<Inode> {
-        let offset = self.core.get_inode_offset(nid) as usize;
+        let offset = self.core.get_inode_offset(nid)?;
         let mut buf = vec![0u8; InodeExtended::size()];
         self.image.read_exact_at(&mut buf, offset).await?;
         self.core.parse_inode(&buf, nid)

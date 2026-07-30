@@ -154,7 +154,7 @@ impl<I: Image> EroFS<I> {
     }
 
     pub fn get_inode(&self, nid: u64) -> Result<Inode> {
-        let offset = self.core.get_inode_offset(nid) as usize;
+        let offset = self.core.get_inode_offset(nid)?;
         let data = self
             .image
             .get(offset..)
