@@ -37,6 +37,10 @@ impl<'a, I: AsyncImage> File<'a, I> {
     ///
     /// Returns the number of bytes read, or `0` if EOF has been reached.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
         if self.offset >= self.inode.data_size() {
             return Ok(0);
         }
