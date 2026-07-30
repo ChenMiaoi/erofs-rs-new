@@ -125,8 +125,7 @@ mod tests {
         image[SUPERBLOCK_OFFSET..SUPERBLOCK_OFFSET + 4]
             .copy_from_slice(&MAGIC_NUMBER.to_le_bytes());
         image[SUPERBLOCK_OFFSET + 12] = 12;
-        image[SUPERBLOCK_OFFSET + 40..SUPERBLOCK_OFFSET + 44]
-            .copy_from_slice(&1_u32.to_le_bytes());
+        image[SUPERBLOCK_OFFSET + 40..SUPERBLOCK_OFFSET + 44].copy_from_slice(&1_u32.to_le_bytes());
         image[BLOCK_SIZE + 4..BLOCK_SIZE + 6].copy_from_slice(&0o040755_u16.to_le_bytes());
         image[BLOCK_SIZE + 8..BLOCK_SIZE + 12].copy_from_slice(&16_u32.to_le_bytes());
         image[BLOCK_SIZE + 16..BLOCK_SIZE + 20].copy_from_slice(&2_u32.to_le_bytes());
@@ -136,7 +135,9 @@ mod tests {
 
         let fs = EroFS::new(SliceImage::new(&image)).unwrap();
         let mut walker = fs.walk_dir("/").unwrap();
-        assert!(matches!(walker.next(), Some(Err(Error::CorruptedData(message))) if message == "directory traversal cycle"));
+        assert!(
+            matches!(walker.next(), Some(Err(Error::CorruptedData(message))) if message == "directory traversal cycle")
+        );
     }
 
     #[test]
