@@ -11,6 +11,7 @@ use typed_path::UnixPath;
 pub struct WalkDir<'a, I: AsyncImage> {
     erofs: &'a EroFS<I>,
     dir_stack: Vec<(usize, ReadDir<'a, I>)>,
+    ancestor_nids: Vec<u64>,
     max_depth: usize,
 }
 
@@ -26,6 +27,7 @@ pub struct WalkDirEntry {
 
 impl<'a, I: AsyncImage> WalkDir<'a, I> {
     pub(crate) async fn new(erofs: &'a EroFS<I>, root: impl AsRef<UnixPath>) -> Result<Self> {
+        let root_nid;
         let read_dir = {
             let inode = erofs
                 .get_path_inode(root.as_ref())
@@ -38,11 +40,13 @@ impl<'a, I: AsyncImage> WalkDir<'a, I> {
                 ));
             }
 
+            root_nid = inode.id();
             ReadDir::new(erofs, inode, root).await?
         };
         Ok(WalkDir {
             erofs,
             dir_stack: vec![(1, read_dir)],
+            ancestor_nids: vec![root_nid],
             max_depth: 0,
         })
     }
@@ -64,8 +68,12 @@ impl<'a, I: AsyncImage> WalkDir<'a, I> {
         let inode = self.erofs.get_inode(dir_entry.nid()).await?;
 
         if (depth < self.max_depth || self.max_depth == 0) && dir_entry.file_type().is_dir() {
+            if contains_nid(&self.ancestor_nids, inode.id()) {
+                return Err(Error::CorruptedData("directory traversal cycle".into()));
+            }
             let child_dir = ReadDir::new(self.erofs, inode, dir_entry.path()).await?;
             self.dir_stack.push((depth + 1, child_dir));
+            self.ancestor_nids.push(inode.id());
         }
 
         Ok(WalkDirEntry {
@@ -87,9 +95,26 @@ impl<'a, I: AsyncImage> WalkDir<'a, I> {
                 Ok(Some(entry)) => return Some(self.get_walk_dir_entry(entry, depth).await),
                 Ok(None) => {
                     self.dir_stack.pop();
+                    self.ancestor_nids.pop();
                 }
                 Err(e) => return Some(Err(e)),
             }
         }
+    }
+}
+
+fn contains_nid(nids: &[u64], nid: u64) -> bool {
+    nids.contains(&nid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_nid;
+
+    #[test]
+    fn detects_directory_ancestor_cycle() {
+        assert!(contains_nid(&[1, 2, 3], 1));
+        assert!(contains_nid(&[1, 2, 3], 3));
+        assert!(!contains_nid(&[1, 2, 3], 4));
     }
 }
