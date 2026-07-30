@@ -194,6 +194,12 @@ struct ProcessOutput {
     truncated_stderr: bool,
 }
 
+#[derive(Debug)]
+struct CapturedLog {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
 /// Executes one oracle profile and appends an immutable run record.
 pub fn run_oracle(
     manifest_path: &Path,
@@ -377,18 +383,11 @@ fn run_sandboxed(
         Ok(child) => child,
         Err(error) => return Ok(harness_output(&format!("sandbox spawn failed: {error}"))),
     };
-    let mut stdout = child.stdout.take().ok_or(Error::InvalidInput)?;
-    let mut stderr = child.stderr.take().ok_or(Error::InvalidInput)?;
-    let stdout_thread = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stdout.read_to_end(&mut bytes);
-        bytes
-    });
-    let stderr_thread = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stderr.read_to_end(&mut bytes);
-        bytes
-    });
+    let stdout = child.stdout.take().ok_or(Error::InvalidInput)?;
+    let stderr = child.stderr.take().ok_or(Error::InvalidInput)?;
+    let output_limit = limits.output_bytes;
+    let stdout_thread = thread::spawn(move || capture_log(stdout, output_limit));
+    let stderr_thread = thread::spawn(move || capture_log(stderr, output_limit));
     let deadline = start + Duration::from_millis(limits.timeout_ms);
     let (status, timed_out) = loop {
         if let Some(status) = child.try_wait()? {
@@ -400,18 +399,16 @@ fn run_sandboxed(
         }
         thread::sleep(Duration::from_millis(if qemu { 20 } else { 5 }));
     };
-    let mut stdout = stdout_thread.join().map_err(|_| Error::InvalidInput)?;
-    let mut stderr = stderr_thread.join().map_err(|_| Error::InvalidInput)?;
-    let truncated_stdout = truncate_log(&mut stdout, limits.output_bytes);
-    let truncated_stderr = truncate_log(&mut stderr, limits.output_bytes);
+    let stdout = stdout_thread.join().map_err(|_| Error::InvalidInput)?;
+    let stderr = stderr_thread.join().map_err(|_| Error::InvalidInput)?;
     Ok(ProcessOutput {
         status,
-        stdout,
-        stderr,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
         wall: start.elapsed(),
         timed_out,
-        truncated_stdout,
-        truncated_stderr,
+        truncated_stdout: stdout.truncated,
+        truncated_stderr: stderr.truncated,
     })
 }
 
@@ -720,13 +717,21 @@ fn artifact(bytes: &[u8], truncated: bool) -> ArtifactRecord {
         truncated,
     }
 }
-fn truncate_log(bytes: &mut Vec<u8>, limit: u64) -> bool {
-    if bytes.len() as u64 > limit {
-        bytes.truncate(limit as usize);
-        true
-    } else {
-        false
+fn capture_log(mut reader: impl Read, limit: u64) -> CapturedLog {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+    let mut buffer = [0; 8 * 1024];
+    let mut truncated = false;
+    while let Ok(read) = reader.read(&mut buffer) {
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(bytes.len());
+        let retained = read.min(remaining);
+        bytes.extend_from_slice(&buffer[..retained]);
+        truncated |= retained != read;
     }
+    CapturedLog { bytes, truncated }
 }
 fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -820,10 +825,10 @@ mod tests {
     }
 
     #[test]
-    fn log_truncation_is_explicit() {
-        let mut bytes = vec![b'x'; 8];
-        assert!(truncate_log(&mut bytes, 4));
-        assert_eq!(bytes, b"xxxx");
+    fn log_capture_bounds_retained_bytes_while_draining() {
+        let captured = capture_log(std::io::Cursor::new(vec![b'x'; 32 * 1024]), 7);
+        assert_eq!(captured.bytes, b"xxxxxxx");
+        assert!(captured.truncated);
     }
 
     #[test]
