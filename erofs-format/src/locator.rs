@@ -1099,7 +1099,10 @@ fn ensure_span<E>(span: Span, image_len: u64) -> Result<(), LocateError<E>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SUPERBLOCK_MAGIC, SliceReader, schema::field_by_id};
+    use crate::{
+        SUPERBLOCK_MAGIC, SliceReader,
+        schema::{FIELDS, Predicate, StructureId, field_by_id},
+    };
 
     fn image() -> [u8; 16 * 1024] {
         let mut image = [0; 16 * 1024];
@@ -1342,5 +1345,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(inode.span.offset, 64);
+    }
+    #[test]
+    fn locates_every_superblock_field_across_feature_views() {
+        let mut plain = image();
+        plain[1037] = 1;
+        let mut with_48bit = plain;
+        with_48bit[1104..1108].copy_from_slice(&FEATURE_INCOMPAT_48BIT.to_le_bytes());
+        let mut with_compression = plain;
+        with_compression[1104..1108].copy_from_slice(&FEATURE_INCOMPAT_COMPR_CFGS.to_le_bytes());
+
+        let plain_reader = SliceReader::new(&plain);
+        let bit48_reader = SliceReader::new(&with_48bit);
+        let compression_reader = SliceReader::new(&with_compression);
+        let locators = [
+            Locator::new(&plain_reader).unwrap(),
+            Locator::new(&bit48_reader).unwrap(),
+            Locator::new(&compression_reader).unwrap(),
+        ];
+
+        for field in FIELDS
+            .iter()
+            .filter(|field| field.structure == StructureId::Superblock)
+        {
+            let located = locators
+                .iter()
+                .any(|locator| locator.locate(ObjectRef::Superblock, field).is_ok());
+            assert!(located, "{} ({:?})", field.id, field.presence);
+            assert!(matches!(
+                field.presence,
+                Predicate::Always
+                    | Predicate::Without48Bit
+                    | Predicate::With48Bit
+                    | Predicate::WithoutCompressionConfig
+                    | Predicate::WithCompressionConfig
+                    | Predicate::Superblock144
+            ));
+        }
     }
 }
