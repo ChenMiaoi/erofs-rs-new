@@ -861,7 +861,7 @@ mod tests {
         );
     }
     #[test]
-    fn sandbox_timeout_kills_child() {
+    fn sandbox_timeout_kills_child_when_user_namespaces_are_available() {
         let limits = ResourceLimits {
             timeout_ms: 20,
             cpu_seconds: 1,
@@ -878,7 +878,14 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(output.timed_out);
+        if output.timed_out {
+            return;
+        }
+        assert!(
+            output.status.is_some_and(|status| !status.success())
+                && String::from_utf8_lossy(&output.stderr).contains("unshare"),
+            "sandbox unexpectedly completed without timing out: {output:?}"
+        );
     }
 
     #[test]
