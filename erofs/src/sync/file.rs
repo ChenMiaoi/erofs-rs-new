@@ -85,19 +85,14 @@ impl<'a, I: Image> Read for File<'a, I> {
 
         let block = block.map_err(|e| std::io::Error::other(format!("read block failed: {e}")))?;
 
-        if buf.len() >= block.len() {
-            let n = block.len();
-            buf[..n].copy_from_slice(block);
-            self.offset += n;
-            Ok(n)
-        } else {
-            let offset = cur_offset % block_size;
-            let n = cmp::min(buf.len(), block.len().saturating_sub(offset));
-            buf[..n].copy_from_slice(&block[offset..offset + n]);
+        let offset = cur_offset % block_size;
+        let n = cmp::min(buf.len(), block.len().saturating_sub(offset));
+        buf[..n].copy_from_slice(&block[offset..offset + n]);
+        self.offset += n;
+        if n < block.len() - offset {
             self.buf = Some(Bytes::copy_from_slice(block));
-            self.offset += n;
-            Ok(n)
         }
+        Ok(n)
     }
 }
 

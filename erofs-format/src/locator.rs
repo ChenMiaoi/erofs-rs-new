@@ -736,7 +736,7 @@ impl<'a, R: ReadAt> Locator<'a, R> {
             });
         }
         let bitmap = self.read_u16(SUPERBLOCK_OFFSET + 84)?;
-        if bitmap & (1 << algorithm) == 0 {
+        if bitmap & (1_u16 << algorithm) == 0 {
             return Err(LocateError::UnresolvedParent {
                 object: ObjectRef::CompressionConfig { algorithm },
                 reason: "algorithm is absent from available_compr_algs",

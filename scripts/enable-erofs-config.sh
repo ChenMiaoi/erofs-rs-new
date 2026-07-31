@@ -3,6 +3,7 @@ set -euo pipefail
 
 linux_dir="${1:-vendor/linux}"
 build_dir="${2:-$linux_dir}"
+arch="${3:-x86_64}"
 config_tool="$linux_dir/scripts/config"
 config_file="$build_dir/.config"
 
@@ -12,7 +13,7 @@ if [[ ! -d "$linux_dir" ]]; then
 fi
 
 mkdir -p "$build_dir"
-make -C "$linux_dir" O="$build_dir" ARCH=x86_64 scripts/config >/dev/null
+make -C "$linux_dir" O="$build_dir" ARCH="$arch" scripts/config >/dev/null
 
 enable_builtin=(
 	EROFS_FS
@@ -51,7 +52,7 @@ for opt in "${enable_builtin[@]}"; do
 	"$config_tool" --file "$config_file" --enable "$opt"
 done
 
-make -C "$linux_dir" O="$build_dir" ARCH=x86_64 olddefconfig >/dev/null
+make -C "$linux_dir" O="$build_dir" ARCH="$arch" olddefconfig >/dev/null
 
 echo "Enabled EROFS kernel options:"
 grep '^CONFIG_EROFS' "$config_file" | sort

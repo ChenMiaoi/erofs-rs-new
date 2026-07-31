@@ -26,7 +26,7 @@ SAMPLE ?= $(EROFS_IMG)
 # path must be doubled to survive -drive parsing. $(subst) needs the comma
 # spelling hidden behind a variable because commas separate its arguments.
 COMMA := ,
-EROFS_DRIVE = -drive file=$(subst $(COMMA),$(COMMA)$(COMMA),$(abspath $(SAMPLE))),if=virtio,format=raw,readonly=on
+EROFS_DRIVE = -drive "file=$(subst $(COMMA),$(COMMA)$(COMMA),$(abspath $(SAMPLE))),if=virtio,format=raw,readonly=on"
 
 KERNEL_CMDLINE := console=ttyS0 earlyprintk=serial panic=-1
 QEMU_ARGS := \
@@ -36,14 +36,26 @@ QEMU_ARGS := \
 	-smp 2 \
 	-nographic \
 	-no-reboot \
-	-kernel $(KERNEL_IMAGE) \
-	-initrd $(INITRAMFS) \
+	-kernel "$(KERNEL_IMAGE)" \
+	-initrd "$(INITRAMFS)" \
 	-append "$(KERNEL_CMDLINE)"
 
 .PHONY: all apt-deps deps-check kernel-config kernel erofs-utils initramfs erofs-image run smoke oracle fuzz-prereqs fuzz coverage clean distclean help
 FUZZ_IMAGE ?= $(EROFS_IMG)
 FUZZ_CORPUS ?= $(BUILD)/metadata-fuzz-corpus
 FUZZ_ARGS ?=
+ifeq ($(ARCH),x86_64)
+else
+$(error ARCH must be x86_64)
+endif
+ifneq ($(filter 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32,$(JOBS)),)
+else
+$(error JOBS must be a positive integer from 1 to 32)
+endif
+ifneq ($(filter tcg kvm,$(QEMU_ACCEL)),)
+else
+$(error QEMU_ACCEL must be tcg or kvm)
+endif
 
 all: kernel initramfs erofs-image
 
@@ -142,14 +154,14 @@ erofs-image: erofs-utils
 	$(MKFS_EROFS) $(EROFS_IMG) $(EROFS_SRC)
 
 run: all
-	$(QEMU) $(QEMU_ARGS) $(EROFS_DRIVE)
+	"$(QEMU)" $(QEMU_ARGS) $(EROFS_DRIVE)
 
 oracle: kernel initramfs
 	@test -f "$(SAMPLE)" || { echo "Sample not found: $(SAMPLE)"; exit 1; }
 	@mkdir -p $(BUILD)
 	@set -o pipefail; \
 	source scripts/kernel-replay-common.sh; \
-	timeout 80s $(QEMU) $(QEMU_ARGS) $(EROFS_DRIVE) 2>&1 | tee $(BUILD)/qemu-oracle.log || rc=$$?; \
+	timeout 80s "$(QEMU)" $(QEMU_ARGS) $(EROFS_DRIVE) 2>&1 | tee "$(BUILD)/qemu-oracle.log" || rc=$$?; \
 	qemu_rc="$${rc:-0}"; \
 	if [ "$$qemu_rc" != 0 ] && [ "$$qemu_rc" != 124 ]; then exit "$$qemu_rc"; fi; \
 	classify_dmesg "$(BUILD)/qemu-oracle.log" "$$qemu_rc"; \
@@ -160,7 +172,7 @@ smoke: all
 	@mkdir -p $(BUILD)
 	@set -o pipefail; \
 	source scripts/kernel-replay-common.sh; \
-	timeout 80s $(QEMU) $(QEMU_ARGS) $(EROFS_DRIVE) 2>&1 | tee $(BUILD)/qemu-smoke.log || rc=$$?; \
+	timeout 80s "$(QEMU)" $(QEMU_ARGS) $(EROFS_DRIVE) 2>&1 | tee "$(BUILD)/qemu-smoke.log" || rc=$$?; \
 	qemu_rc="$${rc:-0}"; \
 	if [ "$$qemu_rc" != 0 ] && [ "$$qemu_rc" != 124 ]; then exit "$$qemu_rc"; fi; \
 	classify_dmesg "$(BUILD)/qemu-smoke.log" "$$qemu_rc"; \
@@ -168,7 +180,7 @@ smoke: all
 	if [ "$$REPLAY_RESULT" != "ACCEPTED" ]; then exit 1; fi
 
 fuzz:
-	$(ROOT)/examples/metadata-fuzz.sh $(FUZZ_IMAGE) $(FUZZ_CORPUS) --prepare $(FUZZ_ARGS)
+	"$(ROOT)/examples/metadata-fuzz.sh" "$(FUZZ_IMAGE)" "$(FUZZ_CORPUS)" --prepare $(FUZZ_ARGS)
 
 coverage:
 	cargo llvm-cov --workspace --all-features --lcov --output-path target/lcov.info

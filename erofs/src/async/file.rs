@@ -60,18 +60,13 @@ impl<'a, I: AsyncImage> File<'a, I> {
         let block_size = self.erofs.block_size();
         let cur_offset = self.offset;
         let block = self.erofs.read_inode_block(&self.inode, cur_offset).await?;
-        if buf.len() >= block.len() {
-            let n = block.len();
-            buf[..n].copy_from_slice(&block);
-            self.offset += n;
-            Ok(n)
-        } else {
-            let offset = cur_offset % block_size;
-            let n = cmp::min(buf.len(), block.len().saturating_sub(offset));
-            buf[..n].copy_from_slice(&block[offset..offset + n]);
+        let offset = cur_offset % block_size;
+        let n = cmp::min(buf.len(), block.len().saturating_sub(offset));
+        buf[..n].copy_from_slice(&block[offset..offset + n]);
+        self.offset += n;
+        if n < block.len() - offset {
             self.buf = Some(Bytes::from(block));
-            self.offset += n;
-            Ok(n)
         }
+        Ok(n)
     }
 }

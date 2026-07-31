@@ -212,6 +212,7 @@ make fuzz FUZZ_CORPUS=/srv/erofs-corpus \
 
 # Exactly ten generated cases, independent of their total execution time.
 make fuzz FUZZ_ARGS='--cases 10 --funnel all'
+```
 
 The Makefile entry point uses `build/rootfs.erofs` and
 `build/metadata-fuzz-corpus` by default. Override `FUZZ_IMAGE` or `FUZZ_CORPUS`,
