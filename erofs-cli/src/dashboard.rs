@@ -56,11 +56,11 @@ pub struct CampaignDashboard {
 }
 
 pub fn is_supported() -> bool {
-    io::stdout().is_terminal()
+    io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
 impl CampaignDashboard {
-    pub fn start() -> Result<Self> {
+    pub fn start(control: erofs_lab::campaign::CampaignControl) -> Result<Self> {
         if !is_supported() {
             bail!("interactive dashboard requires a terminal");
         }
@@ -76,6 +76,7 @@ impl CampaignDashboard {
         let listener_stop = Arc::clone(&stop_listener);
         let listener_completion = Arc::clone(&completion_mode);
         let listener_acknowledged = Arc::clone(&acknowledged);
+        let control = Arc::new(control);
         let listener = thread::spawn(move || {
             while !listener_stop.load(Ordering::Relaxed) {
                 if matches!(event::poll(Duration::from_millis(100)), Ok(true)) {
@@ -84,7 +85,7 @@ impl CampaignDashboard {
                             if key.code == KeyCode::Char('c')
                                 && key.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
-                            erofs_lab::campaign::request_cancel()
+                            control.cancel()
                         }
                         Ok(Event::Key(key))
                             if listener_completion.load(Ordering::Relaxed)
@@ -216,7 +217,8 @@ impl CampaignDashboard {
             published.novelty.display(),
         );
         self.render()?;
-        while !self.acknowledged.load(Ordering::Relaxed) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !self.acknowledged.load(Ordering::Relaxed) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
         Ok(())

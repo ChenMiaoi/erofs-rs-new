@@ -5,8 +5,8 @@ use clap::{Args, Subcommand, ValueEnum};
 use erofs_lab::{
     IntegrityPolicy, MutationMode, ObjectRef,
     campaign::{
-        CampaignBudget, CampaignSpec, CampaignTarget, FunnelPolicy, MinimizeRequest, clear_cancel,
-        minimize_case, run_campaign, run_campaign_with_progress,
+        CampaignBudget, CampaignControl, CampaignSpec, CampaignTarget, FunnelPolicy,
+        MinimizeRequest, minimize_case, run_campaign, run_campaign_with_progress_control,
     },
     oracle::{OracleProfile, ResourceLimits},
 };
@@ -152,17 +152,13 @@ fn run(args: RunArgs) -> Result<()> {
         },
         funnel: funnel(args.funnel),
     };
+    if args.prepare {
+        prepare_workspace(&args.workspace)?;
+    }
     let use_tui = !args.no_tui && crate::dashboard::is_supported();
     if use_tui {
-        clear_cancel();
-        let mut dashboard = crate::dashboard::CampaignDashboard::start()?;
-        if args.prepare {
-            dashboard.set_status(
-                "preparing oracle environment",
-                "Building kernel, initramfs, and erofs-utils; build output is captured until failure...",
-            )?;
-            prepare_workspace(&args.workspace)?;
-        }
+        let control = CampaignControl::new();
+        let mut dashboard = crate::dashboard::CampaignDashboard::start(control.clone())?;
         let paths = if spec.funnel == FunnelPolicy::MaterializeOnly {
             None
         } else {
@@ -176,12 +172,13 @@ fn run(args: RunArgs) -> Result<()> {
             "generating campaign",
             "Building deterministic mutation recipe...",
         )?;
-        let published = run_campaign_with_progress(
+        let published = run_campaign_with_progress_control(
             &args.image,
             &args.output_dir,
             spec,
             paths.as_ref(),
             ResourceLimits::default(),
+            control,
             |progress| {
                 let _ = dashboard.update(progress);
             },
