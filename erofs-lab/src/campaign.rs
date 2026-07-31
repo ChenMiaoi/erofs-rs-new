@@ -4,6 +4,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -25,6 +26,21 @@ const REPORT_SCHEMA: &str = "erofs-campaign-report/v1";
 const NOVELTY_SCHEMA: &str = "erofs-novelty-index/v1";
 const MINIMIZED_SCHEMA: &str = "erofs-minimized-recipe/v1";
 const PRNG: &str = "chacha12/v1";
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Requests graceful campaign cancellation at the next safe interruption point.
+pub fn request_cancel() {
+    CANCELLED.store(true, Ordering::Relaxed);
+}
+
+/// Clears a previously requested cancellation before starting a campaign.
+pub fn clear_cancel() {
+    CANCELLED.store(false, Ordering::Relaxed);
+}
+
+pub(crate) fn is_cancelled() -> bool {
+    CANCELLED.load(Ordering::Relaxed)
+}
 
 /// One symbolic field target available to a campaign.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -62,6 +78,8 @@ pub enum FunnelPolicy {
 #[serde(deny_unknown_fields)]
 pub struct CampaignSpec {
     pub seed: String,
+    /// Number of deterministic cases to skip before selecting this campaign window.
+    pub case_offset: u64,
     pub mode: MutationMode,
     pub integrity: IntegrityPolicy,
     pub targets: Vec<CampaignTarget>,
@@ -139,6 +157,19 @@ impl RecipeIntent {
     }
 }
 
+/// Semantic outcome expected from a deliberately classified mutation seed.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedExpectation {
+    /// The mutator makes no semantic claim; only safety findings are meaningful.
+    #[default]
+    Exploratory,
+    /// A constrained, checksum-repaired seed must be accepted by the oracle.
+    Accepted,
+    /// A deliberately invalid seed must be rejected cleanly by the oracle.
+    Rejected,
+}
+
 /// One realized deterministic campaign case.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -146,6 +177,8 @@ pub struct RecipeCase {
     pub id: String,
     pub generator: String,
     pub intents: Vec<RecipeIntent>,
+    #[serde(default)]
+    pub expectation: SeedExpectation,
 }
 
 /// Immutable recipe. `seed + spec` rebuilds cases; recorded cases remain audit authority.
@@ -192,6 +225,10 @@ pub struct CampaignCaseReport {
     pub duplicate_plan: bool,
     pub planning_error: Option<String>,
     pub oracle_results: Vec<ResultIdentity>,
+    #[serde(default)]
+    pub expectation: SeedExpectation,
+    #[serde(default)]
+    pub expectation_mismatch: bool,
 }
 
 /// Campaign execution report.
@@ -215,17 +252,105 @@ pub struct PublishedCampaign {
     pub result: CampaignReport,
 }
 
-/// Incremental campaign state emitted after every completed case.
+/// Aggregated outcome counts for one completed campaign.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CampaignSummary {
+    pub cases_completed: usize,
+    pub samples_materialized: usize,
+    pub duplicate_bytes: usize,
+    pub duplicate_plans: usize,
+    pub planning_errors: usize,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub crashes: usize,
+    pub timeouts: usize,
+    pub resource_exhausted: usize,
+    pub unsupported: usize,
+    pub harness_errors: usize,
+    pub expected_accepted: usize,
+    pub expected_rejected: usize,
+    pub expectation_mismatches: usize,
+}
+
+impl CampaignSummary {
+    pub fn from_report(report: &CampaignReport) -> Self {
+        let mut summary = Self::default();
+        for case in &report.cases {
+            summary.cases_completed += 1;
+            summary.samples_materialized +=
+                usize::from(case.sample_sha256.is_some() && !case.duplicate_bytes);
+            summary.duplicate_bytes += usize::from(case.duplicate_bytes);
+            summary.duplicate_plans += usize::from(case.duplicate_plan);
+            summary.planning_errors += usize::from(case.planning_error.is_some());
+            match case.expectation {
+                SeedExpectation::Accepted => summary.expected_accepted += 1,
+                SeedExpectation::Rejected => summary.expected_rejected += 1,
+                SeedExpectation::Exploratory => {}
+            }
+            summary.expectation_mismatches += usize::from(case.expectation_mismatch);
+            for result in &case.oracle_results {
+                match result.status.as_str() {
+                    "accepted" => summary.accepted += 1,
+                    "rejected" => summary.rejected += 1,
+                    "crashed" => summary.crashes += 1,
+                    "timed_out" => summary.timeouts += 1,
+                    "resource_exhausted" => summary.resource_exhausted += 1,
+                    "unsupported" => summary.unsupported += 1,
+                    "harness_error" => summary.harness_errors += 1,
+                    _ => {}
+                }
+            }
+        }
+        summary
+    }
+
+    pub const fn abnormal_oracle_results(&self) -> usize {
+        self.crashes + self.timeouts + self.resource_exhausted + self.harness_errors
+    }
+}
+
+/// Current work stage for one campaign case.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CampaignPhase {
+    Planning,
+    Materializing,
+    RustOracle,
+    FsckOracle,
+    LinuxOracle,
+    Complete,
+}
+
+impl CampaignPhase {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Planning => "planning metadata mutation",
+            Self::Materializing => "publishing unique sample",
+            Self::RustOracle => "running Rust reader oracle",
+            Self::FsckOracle => "running fsck oracle",
+            Self::LinuxOracle => "booting Linux KASAN oracle",
+            Self::Complete => "case complete",
+        }
+    }
+}
+
+/// Incremental campaign state emitted before costly work and after each case.
 #[derive(Clone, Debug)]
 pub struct CampaignProgress<'a> {
     pub total_cases: usize,
     pub completed_cases: usize,
     pub samples_materialized: u64,
     pub oracle_runs: u64,
-    pub current_case: &'a CampaignCaseReport,
+    pub elapsed: Duration,
+    pub wall_time_budget: Duration,
+    pub phase: CampaignPhase,
+    pub case_id: &'a str,
+    pub generator: &'a str,
+    pub mutation_count: usize,
+    pub expectation: SeedExpectation,
+    pub expectation_mismatch: bool,
+    pub completed_case: Option<&'a CampaignCaseReport>,
 }
 
-/// Result of signature-preserving minimization.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MinimizedRecipe {
@@ -252,17 +377,19 @@ pub fn generate_recipe(parent: &[u8], spec: CampaignSpec) -> Result<CampaignReci
         ));
     }
     let seed = parse_u64(&spec.seed)?;
-    let mut cases = deterministic_cases(&spec.targets)?;
-    let remaining = usize::try_from(spec.budget.max_samples)
-        .map_err(|_| Error::Bounds)?
-        .saturating_sub(cases.len());
+    let max_samples = usize::try_from(spec.budget.max_samples).map_err(|_| Error::Bounds)?;
+    let offset = usize::try_from(spec.case_offset).map_err(|_| Error::Bounds)?;
+    let requested = offset.checked_add(max_samples).ok_or(Error::Bounds)?;
+    let mut cases = deterministic_cases(&spec.targets, spec.integrity)?;
+    let remaining = requested.saturating_sub(cases.len());
     cases.extend(combination_cases(
         &spec.targets,
         seed,
         remaining,
         spec.budget.max_mutations_per_sample,
     )?);
-    cases.truncate(usize::try_from(spec.budget.max_samples).map_err(|_| Error::Bounds)?);
+    cases.drain(..offset.min(cases.len()));
+    cases.truncate(max_samples);
     Ok(CampaignRecipe {
         schema: RECIPE_SCHEMA.into(),
         prng: PRNG.into(),
@@ -296,10 +423,13 @@ pub fn run_campaign(
     oracle_paths: Option<&OraclePaths>,
     limits: ResourceLimits,
 ) -> Result<PublishedCampaign, Error> {
+    clear_cancel();
     run_campaign_with_progress(parent_path, corpus, spec, oracle_paths, limits, |_| {})
 }
 
 /// Runs a campaign and reports completed-case statistics synchronously.
+/// Callers may persist or display progress without changing recipe, sample,
+/// report, or novelty semantics.
 pub fn run_campaign_with_progress<F>(
     parent_path: &Path,
     corpus: &Path,
@@ -328,10 +458,31 @@ where
     let total_cases = recipe.cases.len();
 
     for case in &recipe.cases {
-        if start.elapsed() > Duration::from_millis(recipe.spec.budget.wall_time_ms) {
+        if is_cancelled() {
+            stopped_reason = "cancelled".into();
+            break;
+        }
+        if recipe.spec.budget.wall_time_ms != 0
+            && start.elapsed() > Duration::from_millis(recipe.spec.budget.wall_time_ms)
+        {
             stopped_reason = "wall_time".into();
             break;
         }
+        progress(CampaignProgress {
+            expectation: case.expectation,
+            expectation_mismatch: false,
+            total_cases,
+            completed_cases: reports.len(),
+            samples_materialized: materialized,
+            oracle_runs,
+            elapsed: start.elapsed(),
+            wall_time_budget: Duration::from_millis(recipe.spec.budget.wall_time_ms),
+            phase: CampaignPhase::Planning,
+            case_id: &case.id,
+            generator: &case.generator,
+            mutation_count: case.intents.len(),
+            completed_case: None,
+        });
         let intents = resolve_intents(&case.intents)?;
         let resolved = match plan(&parent, &intents, recipe.spec.mode, recipe.spec.integrity) {
             Ok(plan) => plan,
@@ -344,15 +495,20 @@ where
                     duplicate_plan: false,
                     planning_error: Some(error.to_string()),
                     oracle_results: Vec::new(),
+                    expectation: case.expectation,
+                    expectation_mismatch: false,
                 });
-                let current_case = reports.last().expect("report was just added");
-                progress(CampaignProgress {
+                report_progress(
+                    &mut progress,
                     total_cases,
-                    completed_cases: reports.len(),
-                    samples_materialized: materialized,
+                    &reports,
+                    materialized,
                     oracle_runs,
-                    current_case,
-                });
+                    start.elapsed(),
+                    recipe.spec.budget.wall_time_ms,
+                    CampaignPhase::Complete,
+                    case,
+                );
                 continue;
             }
         };
@@ -368,23 +524,58 @@ where
                 duplicate_plan,
                 planning_error: None,
                 oracle_results: Vec::new(),
+                expectation: case.expectation,
+                expectation_mismatch: false,
             });
-            let current_case = reports.last().expect("report was just added");
-            progress(CampaignProgress {
+            report_progress(
+                &mut progress,
                 total_cases,
-                completed_cases: reports.len(),
-                samples_materialized: materialized,
+                &reports,
+                materialized,
                 oracle_runs,
-                current_case,
-            });
+                start.elapsed(),
+                recipe.spec.budget.wall_time_ms,
+                CampaignPhase::Complete,
+                case,
+            );
             continue;
         }
+        progress(CampaignProgress {
+            total_cases,
+            completed_cases: reports.len(),
+            samples_materialized: materialized,
+            oracle_runs,
+            elapsed: start.elapsed(),
+            wall_time_budget: Duration::from_millis(recipe.spec.budget.wall_time_ms),
+            phase: CampaignPhase::Materializing,
+            case_id: &case.id,
+            generator: &case.generator,
+            mutation_count: case.intents.len(),
+            expectation: case.expectation,
+            expectation_mismatch: false,
+            completed_case: None,
+        });
         let sample = materialize(parent_path, corpus, &resolved)?;
         materialized += 1;
         let mut identities = Vec::new();
         if recipe.spec.funnel != FunnelPolicy::MaterializeOnly {
             let paths =
                 oracle_paths.ok_or(Error::Unsupported("oracle paths required by funnel"))?;
+            progress(CampaignProgress {
+                total_cases,
+                completed_cases: reports.len(),
+                samples_materialized: materialized,
+                oracle_runs,
+                elapsed: start.elapsed(),
+                wall_time_budget: Duration::from_millis(recipe.spec.budget.wall_time_ms),
+                phase: CampaignPhase::RustOracle,
+                case_id: &case.id,
+                generator: &case.generator,
+                mutation_count: case.intents.len(),
+                expectation: case.expectation,
+                expectation_mismatch: false,
+                completed_case: None,
+            });
             let rust = run_profile(&sample, OracleProfile::RustFull, paths, limits.clone())?;
             oracle_runs += 1;
             let rust_novel = record_result(&mut novelty, &rust, &mut identities);
@@ -398,6 +589,21 @@ where
                 )
                 || (rust.result.status == OracleStatus::Rejected && seeded_retention(&case.id));
             if must_escalate && oracle_runs < recipe.spec.budget.max_oracle_runs {
+                progress(CampaignProgress {
+                    total_cases,
+                    completed_cases: reports.len(),
+                    samples_materialized: materialized,
+                    oracle_runs,
+                    elapsed: start.elapsed(),
+                    wall_time_budget: Duration::from_millis(recipe.spec.budget.wall_time_ms),
+                    phase: CampaignPhase::FsckOracle,
+                    case_id: &case.id,
+                    generator: &case.generator,
+                    mutation_count: case.intents.len(),
+                    expectation: case.expectation,
+                    expectation_mismatch: false,
+                    completed_case: None,
+                });
                 let fsck = run_profile(&sample, OracleProfile::FsckFull, paths, limits.clone())?;
                 oracle_runs += 1;
                 let fsck_novel = record_result(&mut novelty, &fsck, &mut identities);
@@ -413,6 +619,21 @@ where
                     ))
                     && oracle_runs < recipe.spec.budget.max_oracle_runs
                 {
+                    progress(CampaignProgress {
+                        total_cases,
+                        completed_cases: reports.len(),
+                        samples_materialized: materialized,
+                        oracle_runs,
+                        elapsed: start.elapsed(),
+                        wall_time_budget: Duration::from_millis(recipe.spec.budget.wall_time_ms),
+                        phase: CampaignPhase::LinuxOracle,
+                        case_id: &case.id,
+                        generator: &case.generator,
+                        mutation_count: case.intents.len(),
+                        expectation: case.expectation,
+                        expectation_mismatch: false,
+                        completed_case: None,
+                    });
                     let linux =
                         run_profile(&sample, OracleProfile::LinuxKasan, paths, limits.clone())?;
                     oracle_runs += 1;
@@ -420,6 +641,7 @@ where
                 }
             }
         }
+        let mismatch = expectation_mismatch(case.expectation, &identities);
         reports.push(CampaignCaseReport {
             case_id: case.id.clone(),
             sample_sha256: Some(sample.output_sha256),
@@ -428,15 +650,20 @@ where
             duplicate_plan,
             planning_error: None,
             oracle_results: identities,
+            expectation: case.expectation,
+            expectation_mismatch: mismatch,
         });
-        let current_case = reports.last().expect("report was just added");
-        progress(CampaignProgress {
+        report_progress(
+            &mut progress,
             total_cases,
-            completed_cases: reports.len(),
-            samples_materialized: materialized,
+            &reports,
+            materialized,
             oracle_runs,
-            current_case,
-        });
+            start.elapsed(),
+            recipe.spec.budget.wall_time_ms,
+            CampaignPhase::Complete,
+            case,
+        );
         if oracle_runs >= recipe.spec.budget.max_oracle_runs
             && recipe.spec.funnel != FunnelPolicy::MaterializeOnly
         {
@@ -461,6 +688,37 @@ where
         novelty: novelty_path,
         result: report,
     })
+}
+fn report_progress<F>(
+    progress: &mut F,
+    total_cases: usize,
+    reports: &[CampaignCaseReport],
+    samples_materialized: u64,
+    oracle_runs: u64,
+    elapsed: Duration,
+    wall_time_ms: u64,
+    phase: CampaignPhase,
+    case: &RecipeCase,
+) where
+    F: FnMut(CampaignProgress<'_>),
+{
+    progress(CampaignProgress {
+        total_cases,
+        completed_cases: reports.len(),
+        samples_materialized,
+        oracle_runs,
+        elapsed,
+        wall_time_budget: Duration::from_millis(wall_time_ms),
+        phase,
+        case_id: &case.id,
+        generator: &case.generator,
+        mutation_count: case.intents.len(),
+        expectation: case.expectation,
+        expectation_mismatch: reports
+            .last()
+            .is_some_and(|report| report.expectation_mismatch),
+        completed_case: reports.last(),
+    });
 }
 
 /// Inputs for one signature-preserving minimization run.
@@ -497,6 +755,7 @@ pub fn minimize_case(request: MinimizeRequest<'_>) -> Result<PathBuf, Error> {
         .iter()
         .find(|case| case.id == case_id)
         .ok_or(Error::Unsupported("campaign case not found"))?;
+
     let mut current = case.intents.clone();
     let mut attempts = 0_u64;
     let confirms = confirmations.max(2);
@@ -587,8 +846,10 @@ pub fn minimize_case(request: MinimizeRequest<'_>) -> Result<PathBuf, Error> {
     write_json_replace(&path, &output)?;
     Ok(path)
 }
-
-fn deterministic_cases(targets: &[CampaignTarget]) -> Result<Vec<RecipeCase>, Error> {
+fn deterministic_cases(
+    targets: &[CampaignTarget],
+    integrity: IntegrityPolicy,
+) -> Result<Vec<RecipeCase>, Error> {
     let mut cases = Vec::new();
     for target in targets {
         let field = field_by_id(&target.field)
@@ -609,7 +870,11 @@ fn deterministic_cases(targets: &[CampaignTarget]) -> Result<Vec<RecipeCase>, Er
                 field: target.field.clone(),
                 value: value.to_string(),
             }];
-            cases.push(case("enumerate-value", &intents)?);
+            cases.push(case(
+                "enumerate-value",
+                &intents,
+                expectation_for_value(&target.field, value, integrity),
+            )?);
         }
         for bit in 0..field.storage.len * 8 {
             let intents = vec![RecipeIntent::UpdateBits {
@@ -618,7 +883,11 @@ fn deterministic_cases(targets: &[CampaignTarget]) -> Result<Vec<RecipeCase>, Er
                 set: (1_u64 << bit).to_string(),
                 clear: "0".into(),
             }];
-            cases.push(case("enumerate-bit", &intents)?);
+            cases.push(case(
+                "enumerate-bit",
+                &intents,
+                expectation_for_bit(&target.field),
+            )?);
         }
     }
     Ok(cases)
@@ -655,27 +924,72 @@ fn combination_cases(
             if field.encoding == Encoding::Bytes {
                 continue;
             }
-            let value = rng.next_u64() & width_max(field.storage.len)?;
             intents.push(RecipeIntent::SetValue {
                 object: target.object.clone(),
                 field: target.field.clone(),
-                value: value.to_string(),
+                value: (rng.next_u64() & width_max(field.storage.len)?).to_string(),
             });
         }
         if !intents.is_empty() {
-            cases.push(case("dependency-combination", &intents)?);
+            cases.push(case(
+                "dependency-combination",
+                &intents,
+                SeedExpectation::Exploratory,
+            )?);
         }
     }
     Ok(cases)
 }
 
-fn case(generator: &str, intents: &[RecipeIntent]) -> Result<RecipeCase, Error> {
+fn expectation_for_value(field: &str, value: u64, integrity: IntegrityPolicy) -> SeedExpectation {
+    match field {
+        "erofs.superblock.magic" => SeedExpectation::Rejected,
+        "erofs.superblock.epoch" | "erofs.superblock.build_time"
+            if integrity == IntegrityPolicy::Recalculate =>
+        {
+            SeedExpectation::Accepted
+        }
+        "erofs.superblock.fixed_nsec"
+            if value <= 999_999_999 && integrity == IntegrityPolicy::Recalculate =>
+        {
+            SeedExpectation::Accepted
+        }
+        _ => SeedExpectation::Exploratory,
+    }
+}
+
+fn expectation_for_bit(field: &str) -> SeedExpectation {
+    if field == "erofs.superblock.magic" {
+        SeedExpectation::Rejected
+    } else {
+        SeedExpectation::Exploratory
+    }
+}
+
+fn case(
+    generator: &str,
+    intents: &[RecipeIntent],
+    expectation: SeedExpectation,
+) -> Result<RecipeCase, Error> {
     let id = sha256(&serde_json::to_vec(intents)?);
     Ok(RecipeCase {
         id,
         generator: generator.into(),
         intents: intents.to_vec(),
+        expectation,
     })
+}
+
+fn expectation_mismatch(expectation: SeedExpectation, results: &[ResultIdentity]) -> bool {
+    match expectation {
+        SeedExpectation::Exploratory => false,
+        SeedExpectation::Accepted => {
+            !results.is_empty() && results.iter().any(|result| result.status != "accepted")
+        }
+        SeedExpectation::Rejected => {
+            !results.is_empty() && results.iter().any(|result| result.status != "rejected")
+        }
+    }
 }
 
 fn run_profile(
@@ -935,6 +1249,7 @@ mod tests {
     fn spec(seed: u64) -> CampaignSpec {
         CampaignSpec {
             seed: seed.to_string(),
+            case_offset: 0,
             mode: MutationMode::Corrupt,
             integrity: IntegrityPolicy::Preserve,
             targets: vec![CampaignTarget {
@@ -974,6 +1289,37 @@ mod tests {
             generate_recipe(&parent, a).unwrap().cases,
             generate_recipe(&parent, b).unwrap().cases
         );
+    }
+
+    #[test]
+    fn expectation_classification_requires_checksum_repair_for_acceptance() {
+        assert_eq!(
+            expectation_for_value("erofs.superblock.epoch", 1, IntegrityPolicy::Recalculate,),
+            SeedExpectation::Accepted
+        );
+        assert_eq!(
+            expectation_for_value("erofs.superblock.epoch", 1, IntegrityPolicy::Preserve,),
+            SeedExpectation::Exploratory
+        );
+        assert_eq!(
+            expectation_for_value("erofs.superblock.magic", 0, IntegrityPolicy::Recalculate,),
+            SeedExpectation::Rejected
+        );
+    }
+
+    #[test]
+    fn expectation_mismatch_requires_an_oracle_result() {
+        let accepted = ResultIdentity {
+            profile: "linux".into(),
+            status: "accepted".into(),
+            phase: "traverse".into(),
+            signature: "linux:accepted".into(),
+        };
+        assert!(!expectation_mismatch(SeedExpectation::Accepted, &[]));
+        assert!(!expectation_mismatch(
+            SeedExpectation::Accepted,
+            &[accepted]
+        ));
     }
     #[test]
     fn novelty_tracks_distinct_identity_classes() {

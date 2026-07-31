@@ -25,6 +25,7 @@ sha2 = { version = "0.10", default-features = false }
 tar = { version = "0.4", default-features = false}
 thiserror = { version = "2", default-features = false }
 tokio = { version = "1", default-features = false }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 typed-path = { version = "0.12", default-features = false }
 url = { version = "2", default-features = false }
 uuid = { version = "1", default-features = false }

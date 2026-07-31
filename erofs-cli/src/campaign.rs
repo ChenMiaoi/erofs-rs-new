@@ -1,12 +1,12 @@
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf, process::Command};
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use erofs_lab::{
     IntegrityPolicy, MutationMode, ObjectRef,
     campaign::{
-        CampaignBudget, CampaignSpec, CampaignTarget, FunnelPolicy, MinimizeRequest, minimize_case,
-        run_campaign, run_campaign_with_progress,
+        CampaignBudget, CampaignSpec, CampaignTarget, FunnelPolicy, MinimizeRequest, clear_cancel,
+        minimize_case, run_campaign, run_campaign_with_progress,
     },
     oracle::{OracleProfile, ResourceLimits},
 };
@@ -58,6 +58,9 @@ struct RunArgs {
     output_dir: PathBuf,
     #[arg(long)]
     seed: u64,
+    /// Skip this many deterministic cases before executing the campaign window.
+    #[arg(long, default_value_t = 0)]
+    case_offset: u64,
     #[arg(long, value_enum, default_value_t = Mode::Corrupt)]
     mode: Mode,
     #[arg(long, value_enum, default_value_t = Integrity::Preserve)]
@@ -90,6 +93,9 @@ struct RunArgs {
     /// Disable the interactive AFL-style dashboard.
     #[arg(long)]
     no_tui: bool,
+    /// Build workspace oracle prerequisites after opening the dashboard.
+    #[arg(long)]
+    prepare: bool,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
 }
@@ -126,6 +132,7 @@ fn run(args: RunArgs) -> Result<()> {
     let object = object(args.object, &args.space, args.nid, args.block, args.index)?;
     let spec = CampaignSpec {
         seed: args.seed.to_string(),
+        case_offset: args.case_offset,
         mode: mode(args.mode),
         integrity: integrity(args.integrity),
         targets: args
@@ -145,15 +152,31 @@ fn run(args: RunArgs) -> Result<()> {
         },
         funnel: funnel(args.funnel),
     };
-    let paths = if spec.funnel == FunnelPolicy::MaterializeOnly {
-        None
-    } else {
-        Some(oracle_paths(&args.workspace)?)
-    };
     let use_tui = !args.no_tui && crate::dashboard::is_supported();
-    let published = if use_tui {
+    if use_tui {
+        clear_cancel();
         let mut dashboard = crate::dashboard::CampaignDashboard::start()?;
-        run_campaign_with_progress(
+        if args.prepare {
+            dashboard.set_status(
+                "preparing oracle environment",
+                "Building kernel, initramfs, and erofs-utils; build output is captured until failure...",
+            )?;
+            prepare_workspace(&args.workspace)?;
+        }
+        let paths = if spec.funnel == FunnelPolicy::MaterializeOnly {
+            None
+        } else {
+            dashboard.set_status(
+                "preparing oracle environment",
+                "Resolving Rust reader, fsck, QEMU kernel, and initramfs artifacts...",
+            )?;
+            Some(oracle_paths(&args.workspace)?)
+        };
+        dashboard.set_status(
+            "generating campaign",
+            "Building deterministic mutation recipe...",
+        )?;
+        let published = run_campaign_with_progress(
             &args.image,
             &args.output_dir,
             spec,
@@ -162,16 +185,22 @@ fn run(args: RunArgs) -> Result<()> {
             |progress| {
                 let _ = dashboard.update(progress);
             },
-        )?
+        )?;
+        dashboard.finish(&published)?;
+        return Ok(());
+    }
+    let paths = if spec.funnel == FunnelPolicy::MaterializeOnly {
+        None
     } else {
-        run_campaign(
-            &args.image,
-            &args.output_dir,
-            spec,
-            paths.as_ref(),
-            ResourceLimits::default(),
-        )?
+        Some(oracle_paths(&args.workspace)?)
     };
+    let published = run_campaign(
+        &args.image,
+        &args.output_dir,
+        spec,
+        paths.as_ref(),
+        ResourceLimits::default(),
+    )?;
     println!("recipe: {}", published.recipe.display());
     println!("report: {}", published.report.display());
     println!("novelty: {}", published.novelty.display());
@@ -181,6 +210,25 @@ fn run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
+fn prepare_workspace(workspace: &std::path::Path) -> Result<()> {
+    let build = workspace.join("build");
+    std::fs::create_dir_all(&build)?;
+    let log = build.join("fuzz-build.log");
+    let output = Command::new("make")
+        .arg("--no-print-directory")
+        .arg("fuzz-prereqs")
+        .current_dir(workspace)
+        .output()?;
+    std::fs::write(&log, &output.stdout)?;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)?
+        .write_all(&output.stderr)?;
+    if !output.status.success() {
+        anyhow::bail!("fuzz prerequisites failed; build log: {}", log.display());
+    }
+    Ok(())
+}
 fn minimize(args: MinimizeArgs) -> Result<()> {
     let paths = oracle_paths(&args.workspace)?;
     let limits = ResourceLimits {

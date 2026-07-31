@@ -393,6 +393,10 @@ fn run_sandboxed(
         if let Some(status) = child.try_wait()? {
             break (Some(status), false);
         }
+        if crate::campaign::is_cancelled() {
+            let _ = child.kill();
+            break (Some(child.wait()?), false);
+        }
         if Instant::now() >= deadline {
             let _ = child.kill();
             break (Some(child.wait()?), true);

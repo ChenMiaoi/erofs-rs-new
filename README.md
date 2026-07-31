@@ -191,6 +191,41 @@ Minimization removes intent groups first, then shrinks field values, bit sets,
 raw patches, and truncate deltas. Every candidate regenerates integrity repair
 and must reproduce the same signature repeatedly in the same profile.
 
+### Long-running metadata fuzzing demo
+
+`examples/metadata-fuzz.sh` repeatedly launches deterministic campaigns over
+superblock metadata: identity, feature flags, sizing, metadata/xattr placement,
+and extension fields. Rounds share a content-addressed corpus and novelty index;
+every generated mutation remains reproducible through its recorded recipe and
+sample manifest. The campaign dashboard is enabled automatically in a terminal.
+
+```bash
+# Build the reader, fsck, kernel, and oracle artifacts for the novelty funnel.
+make all
+
+# Fuzz for one day into a resumable corpus.
+make fuzz
+
+# Seven-day run with a larger deterministic batch and full oracle escalation.
+make fuzz FUZZ_CORPUS=/srv/erofs-corpus \
+  FUZZ_ARGS='--duration-seconds 604800 --samples-per-round 8192 --funnel all'
+
+# Exactly ten generated cases, independent of their total execution time.
+make fuzz FUZZ_ARGS='--cases 10 --funnel all'
+
+The Makefile entry point uses `build/rootfs.erofs` and
+`build/metadata-fuzz-corpus` by default. Override `FUZZ_IMAGE` or `FUZZ_CORPUS`,
+or invoke `examples/metadata-fuzz.sh` directly for the full interface.
+
+`make fuzz` reuses `build/linux/arch/x86/boot/bzImage`, `build/initramfs.cpio.gz`,
+`build/erofs-utils`, and `build/rootfs.erofs` when present. `make fuzz-prereqs`
+performs the same incremental check explicitly; it rebuilds the kernel only when
+its source or configuration has changed.
+
+Use `--funnel materialize-only` for high-throughput mutation generation without
+oracle execution, or `--no-tui` for logs and CI. Run the script with `--help`
+for all bounds and workspace options.
+
 ## Coverage
 
 Install [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov), then generate an LCOV report for the full workspace and enabled features:

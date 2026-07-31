@@ -20,6 +20,7 @@ INITRAMFS := $(BUILD)/initramfs.cpio.gz
 EROFS_SRC := $(BUILD)/erofs-root
 EROFS_IMG := $(BUILD)/rootfs.erofs
 MKFS_EROFS := $(EROFS_UTILS_BUILD)/mkfs/mkfs.erofs
+FUZZ_KERNEL_STAMP := $(BUILD)/fuzz-kernel.fingerprint
 SAMPLE ?= $(EROFS_IMG)
 EROFS_DRIVE = -drive file=$(abspath $(SAMPLE)),if=virtio,format=raw,readonly=on
 
@@ -35,7 +36,10 @@ QEMU_ARGS := \
 	-initrd $(INITRAMFS) \
 	-append "$(KERNEL_CMDLINE)"
 
-.PHONY: all apt-deps deps-check kernel-config kernel erofs-utils initramfs erofs-image run smoke oracle coverage clean distclean help
+.PHONY: all apt-deps deps-check kernel-config kernel erofs-utils initramfs erofs-image run smoke oracle fuzz-prereqs fuzz coverage clean distclean help
+FUZZ_IMAGE ?= $(EROFS_IMG)
+FUZZ_CORPUS ?= $(BUILD)/metadata-fuzz-corpus
+FUZZ_ARGS ?=
 
 all: kernel initramfs erofs-image
 
@@ -52,6 +56,8 @@ help:
 		'  make run            Build everything and boot vendor Linux in QEMU' \
 		'  make smoke          Boot with a timeout and verify mount plus traversal' \
 		'  make oracle SAMPLE=x Boot an arbitrary read-only EROFS sample' \
+		'  make fuzz-prereqs  Reuse or incrementally build fuzz oracle artifacts' \
+		'  make fuzz           Run the long-lived metadata fuzzing demo' \
 		'  make coverage       Generate target/lcov.info with cargo-llvm-cov' \
 		'  make clean          Remove generated build artifacts'
 
@@ -94,6 +100,23 @@ erofs-utils: deps-check
 		mkdir -p $(EROFS_UTILS_BUILD); \
 		cd $(EROFS_UTILS_BUILD) && $(EROFS_UTILS)/configure --disable-fuse && $(MAKE) -j$(JOBS); \
 	fi
+fuzz-prereqs: deps-check erofs-utils
+	@mkdir -p $(BUILD); \
+	stamp="$(FUZZ_KERNEL_STAMP)"; \
+	fingerprint=$$( { \
+		git -C "$(LINUX)" rev-parse HEAD; \
+		git -C "$(LINUX)" diff --quiet || printf '%s\n' dirty; \
+		sha256sum "$(ROOT)/scripts/enable-erofs-config.sh"; \
+	} | sha256sum | cut -d' ' -f1 ); \
+	if [ -f "$(KERNEL_IMAGE)" ] && [ -f "$$stamp" ] && [ "$$(cat "$$stamp")" = "$$fingerprint" ]; then \
+		:; \
+	else \
+		if [ ! -f "$(KERNEL_IMAGE)" ]; then $(MAKE) --no-print-directory kernel; \
+		else $(MAKE) -C $(LINUX) O=$(LINUX_BUILD) ARCH=$(ARCH) -j$(JOBS) bzImage; fi; \
+		printf '%s\n' "$$fingerprint" > "$$stamp"; \
+	fi
+	@if [ ! -f "$(INITRAMFS)" ]; then $(MAKE) --no-print-directory initramfs; fi
+	@if [ ! -f "$(FUZZ_IMAGE)" ]; then $(MAKE) --no-print-directory erofs-image; fi
 
 $(INIT_C): scripts/rootfs-init.c
 	@mkdir -p $(BUILD)
@@ -139,6 +162,9 @@ smoke: all
 	classify_dmesg "$(BUILD)/qemu-smoke.log" "$$qemu_rc"; \
 	echo "$$REPLAY_RESULT: $$REPLAY_MSG"; \
 	if [ "$$REPLAY_RESULT" != "ACCEPTED" ]; then exit 1; fi
+
+fuzz:
+	$(ROOT)/examples/metadata-fuzz.sh $(FUZZ_IMAGE) $(FUZZ_CORPUS) --prepare $(FUZZ_ARGS)
 
 coverage:
 	cargo llvm-cov --workspace --all-features --lcov --output-path target/lcov.info
