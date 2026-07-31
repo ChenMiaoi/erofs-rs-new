@@ -158,7 +158,7 @@ fn run(args: RunArgs) -> Result<()> {
     let use_tui = !args.no_tui && crate::dashboard::is_supported();
     if use_tui {
         let control = CampaignControl::new();
-        let mut dashboard = crate::dashboard::CampaignDashboard::start(control.clone())?;
+        let dashboard = crate::dashboard::CampaignDashboard::start(control.clone())?;
         let paths = if spec.funnel == FunnelPolicy::MaterializeOnly {
             None
         } else {
