@@ -9,7 +9,7 @@ use erofs_rs::{
     types::{SB_EXTSLOT_SIZE, SuperBlock},
 };
 use opendal::{Operator, services};
-use url::{Position, Url};
+use url::Position;
 use uuid::Uuid;
 
 #[derive(Args, Debug)]
@@ -31,15 +31,18 @@ pub struct DumpArgs {
 // Filesystem UUID:                              71bd9ab4-fb8c-47b4-986c-5c901ad547c7
 
 pub async fn dump(args: DumpArgs) -> Result<()> {
-    let block = if args.path.starts_with("http") {
-        let u = Url::parse(&args.path)?;
+    // Treat the path as remote only if it parses as an http(s) URL; anything
+    // else (including local files named http*) is a local path.
+    let url = crate::remote_url(&args.path);
+    let block = if let Some(u) = url {
         let builder = services::Http::default().endpoint(&u[..Position::BeforePath]);
         let op = Operator::new(builder)?.finish();
         let image = OpendalImage::new(op, u.path().to_string());
         let fs = AsyncEroFS::new(image).await?;
         fs.super_block().to_owned()
     } else {
-        let image = MmapImage::new_from_path(args.path)?;
+        // SAFETY: the image file is opened read-only and not modified while mapped
+        let image = unsafe { MmapImage::new_from_path(args.path)? };
         let fs = EroFS::new(image)?;
         fs.super_block().to_owned()
     };

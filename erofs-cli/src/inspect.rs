@@ -10,7 +10,7 @@ use erofs_rs::{
     types::Inode,
 };
 use opendal::{Operator, services};
-use url::{Position, Url};
+use url::Position;
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
@@ -33,9 +33,11 @@ enum InspectSubcommands {
 }
 
 pub async fn inspect(args: InspectArgs) -> Result<()> {
-    if args.image.starts_with("http") {
+    // Treat the image as remote only if it parses as an http(s) URL; anything
+    // else (including local files named http*) is a local path.
+    let url = crate::remote_url(&args.image);
+    if let Some(u) = url {
         // Async path for remote files
-        let u = Url::parse(&args.image)?;
         let builder = services::Http::default().endpoint(&u[..Position::BeforePath]);
         let op = Operator::new(builder)?.finish();
         let image = OpendalImage::new(op, u.path().to_string());
@@ -47,7 +49,8 @@ pub async fn inspect(args: InspectArgs) -> Result<()> {
         }
     } else {
         // Sync path for local files
-        let image = MmapImage::new_from_path(args.image)?;
+        // SAFETY: the image file is opened read-only and not modified while mapped
+        let image = unsafe { MmapImage::new_from_path(args.image)? };
         let fs = EroFS::new(image)?;
 
         match args.operation {
@@ -115,6 +118,12 @@ fn format_time(inode: &Inode) -> String {
     }
 }
 
+/// Escapes control and other non-printable characters in an image-derived
+/// name so it cannot inject terminal escape sequences when printed.
+fn sanitize_name(name: &str) -> String {
+    name.chars().flat_map(char::escape_debug).collect()
+}
+
 fn ls<I: Image>(fs: &EroFS<I>, path: &str) -> Result<()> {
     let read_dir = fs
         .read_dir(path)
@@ -128,7 +137,7 @@ fn ls<I: Image>(fs: &EroFS<I>, path: &str) -> Result<()> {
             format_mode(&inode),
             format_size(&inode),
             format_time(&inode),
-            entry.dir_entry.file_name()
+            sanitize_name(entry.dir_entry.file_name())
         );
     }
 
@@ -162,7 +171,7 @@ async fn ls_async<I: AsyncImage>(fs: &AsyncEroFS<I>, path: &str) -> Result<()> {
             format_mode(&inode),
             format_size(&inode),
             format_time(&inode),
-            entry.dir_entry.file_name()
+            sanitize_name(entry.dir_entry.file_name())
         );
     }
 
@@ -191,4 +200,21 @@ async fn cat_async<I: AsyncImage>(fs: &AsyncEroFS<I>, path: &str) -> Result<()> 
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_name;
+
+    #[test]
+    fn sanitize_name_leaves_printable_names_untouched() {
+        assert_eq!(sanitize_name("plain file.txt"), "plain file.txt");
+    }
+
+    #[test]
+    fn sanitize_name_escapes_control_characters() {
+        assert_eq!(sanitize_name("evil\u{1b}[2J"), "evil\\u{1b}[2J");
+        assert_eq!(sanitize_name("new\nline"), "new\\nline");
+        assert_eq!(sanitize_name("carriage\rreturn"), "carriage\\rreturn");
+    }
 }

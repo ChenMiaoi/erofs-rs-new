@@ -26,6 +26,7 @@ memmap2 = { workspace = true, default-features = true }
 opendal = { workspace = true, default-features = true, features = ["services-http"] }
 tar = { workspace = true, default-features = true }
 tokio = { workspace = true, default-features = true, features = ["full"] }
+typed-path = { workspace = true }
 ratatui = { workspace = true }
 url = { workspace = true, default-features = true }
 uuid = { workspace = true, default-features = true }
