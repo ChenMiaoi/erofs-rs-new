@@ -1,29 +1,28 @@
 # erofs-rs
 
-A pure Rust library for reading [EROFS](https://docs.kernel.org/filesystems/erofs.html) (Enhanced Read-Only File System) images.
-
-For implementation coverage, the pinned Linux EROFS disk ABI, and fuzzing and injection field registration, see the compiled schema exposed by `erofs-cli field list --schema`.
-
-> **Note**: This library aims to provide essential parsing and inspection capabilities for common use cases, not a full reimplementation of [erofs-utils](https://github.com/erofs/erofs-utils).
+A pure Rust reader and inspection toolkit for [EROFS](https://docs.kernel.org/filesystems/erofs.html) images. The project focuses on checked on-disk parsing, read-only filesystem access, and deterministic malformed-image testing. It is not a Rust reimplementation of [erofs-utils](https://github.com/erofs/erofs-utils).
 
 ## Features
 
-- A dedicated `no_std` format crate for endian decoding and checked image offsets
-- Zero-copy reader backends using mmap or borrowed byte slices
-- Directory traversal and file reading
-- Multiple data layouts: flat plain, flat inline, chunk-based
+- `no_std` EROFS format primitives with checked image offsets
+- Synchronous and asynchronous filesystem readers
+- mmap, borrowed-slice, and optional OpenDAL backends
+- Directory traversal and file reads for supported layouts
+- Schema-backed field location with provenance and structured errors
+- Deterministic mutation, replay, oracle, campaign, and minimization tooling
 
-## Vendor Linux boot environment
+## Repository layout
 
-The repository pins `vendor/linux` and `vendor/erofs-utils` submodules. Build a `mkfs.erofs` image and boot Linux under QEMU with:
+- `erofs-format`: `no_std` on-disk decoding, schema metadata, and the field locator.
+- `erofs`: the standard-library filesystem reader.
+- `erofs-lab`: deterministic mutation, corpus, oracle, and minimization library.
+- `erofs-cli`: inspection, conversion, mutation, replay, oracle, and campaign commands.
+- `scripts/` and `Makefile`: the pinned Linux/QEMU workflow used for boot and fuzzing.
 
-```bash
-git submodule update --init --depth 1
-make all
-make run
-```
+The workspace requires Rust 1.89 or newer. `vendor/linux` and
+`vendor/erofs-utils` are git submodules used by the boot and fuzzing workflow.
 
-## Usage
+## Library usage
 
 ### High-level reader
 
@@ -32,28 +31,25 @@ use std::io::Read;
 use erofs_rs::{EroFS, backend::MmapImage};
 
 fn main() -> erofs_rs::Result<()> {
-    let image = MmapImage::new_from_path("system.erofs")?;
+    // SAFETY: the image must not be modified while it is mapped.
+    let image = unsafe { MmapImage::new_from_path("system.erofs")? };
     let fs = EroFS::new(image)?;
 
-    // Read file
     let mut file = fs.open("/etc/os-release")?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
 
-    // List directory
     for entry in fs.read_dir("/usr/bin")? {
         println!("{}", entry?.dir_entry.file_name());
     }
-
     Ok(())
 }
 ```
 
 ### Low-level `no_std` format primitives
 
-The high-level `erofs-rs` reader is intentionally `std`-only. OS-independent
-on-disk decoding and checked `u64` image offsets live in the separate
-`erofs-format` crate, which has no default features and forbids unsafe code.
+The high-level reader is `std`-only. Use `erofs-format` for OS-independent
+on-disk decoding and checked image offsets.
 
 ```rust
 use erofs_format::{ReadAt, SliceReader, Span, primary_inode_offset};
@@ -66,115 +62,75 @@ assert!(Span::new(inode_offset, 2)?.is_within(image.len()));
 # Ok::<(), erofs_format::Error>(())
 ```
 
-## Feature Flags
-
-- `std` (default): Compatibility feature retained for existing 0.2.x dependents; the high-level reader is always std-only
-- `opendal`: Enables async I/O via [Apache OpenDAL](https://opendal.apache.org/), supporting remote backends (HTTP, S3, etc.)
+## Feature flags
 
 ```toml
-# High-level reader
 [dependencies]
 erofs-rs = "0.2.1"
+erofs-format = "0.1.0"
+```
 
-# Async reader with OpenDAL
+Enable OpenDAL-backed asynchronous I/O when needed:
+
+```toml
 [dependencies]
 erofs-rs = { version = "0.2.1", features = ["opendal"] }
-
-# Low-level no_std format primitives
-[dependencies]
-erofs-format = "0.1.0"
 ```
 
 ## CLI
 
+Build the CLI with `cargo build -p erofs-cli`. The available top-level
+commands are `dump`, `inspect`, `convert`, `field`, `inject`, `replay`,
+`oracle`, and `campaign`. Each command provides detailed help with `--help`.
+
 ```bash
-# Dump superblock info
+# Inspect a local image.
 erofs-cli dump image.erofs
-
-# List directory
 erofs-cli inspect -i image.erofs ls /
+erofs-cli inspect -i image.erofs cat /etc/os-release
 
-# Read file content
-erofs-cli inspect -i image.erofs cat /etc/passwd
+# Convert a supported image tree to tar.
+erofs-cli convert image.erofs --output out.tar
 
-# Convert to tar
-erofs-cli convert image.erofs -o out.tar
-
-# Remote images via HTTP (async OpenDAL backend)
-erofs-cli dump http://example.com/images/system.erofs
-erofs-cli inspect -i http://example.com/images/system.erofs ls /
-erofs-cli inspect -i http://example.com/images/system.erofs cat /etc/os-release
-```
-
-### Pinned ABI field locator
-
-The `erofs-format` schema and locator are independent of the high-level reader.
-They expose stable field IDs, checked absolute spans, raw/decoded values,
-feature predicates, provenance, and structured failures for the M1 superblock,
-primary inode, and flat-directory subset.
-
-```bash
+# List and locate schema fields.
 erofs-cli field list --schema
 erofs-cli field locate image.erofs --object inode --space primary --nid 36 \
   --field erofs.inode.compact.i_format --json
-erofs-cli field locate image.erofs --object dirent --nid 36 --block 0 --index 0 \
-  --field erofs.dirent.nameoff --mode tolerant --json
 ```
 
-### Deterministic mutation and replay
+HTTP images are supported by the CLI commands that use the OpenDAL backend:
 
-M2 resolves symbolic mutations against an immutable baseline, records exact
-before/after patches, publishes samples by SHA-256, and replays manifests
-without invoking the current locator. Canonical samples are read-only and live
-under `samples/sha256/<output-sha256>`.
+```bash
+erofs-cli dump https://example.com/images/system.erofs
+erofs-cli inspect -i https://example.com/images/system.erofs ls /
+```
+
+### Mutation and replay
+
+Mutation commands resolve symbolic fields against an immutable baseline and
+publish content-addressed samples. Replay uses the recorded manifest rather
+than re-resolving the current locator.
 
 ```bash
 erofs-cli inject set image.erofs --output-dir corpus \
   --object superblock --field erofs.superblock.fixed_nsec --value 1 \
   --integrity recalculate
-erofs-cli inject bits image.erofs --output-dir corpus \
-  --object superblock --field erofs.superblock.feature_compat --set 0x2
-erofs-cli inject bytes image.erofs --output-dir corpus \
-  --object superblock --field erofs.superblock.volume_name \
-  --hex 65726f66732d6d75746174696f6e0000
-erofs-cli inject raw image.erofs --output-dir corpus \
-  --offset 0x428 --hex ff00aa55 --mode raw
-erofs-cli inject truncate image.erofs --output-dir corpus \
-  --length 3072 --mode raw
+
 erofs-cli replay corpus/samples/sha256/HASH/sample.json \
   --parent image.erofs --output-dir replayed-corpus
 ```
 
-### Independent oracle profiles
+### Oracle and campaigns
 
-M3 runs each oracle in a separate process under a user and network namespace,
-with CPU, address-space, file-size, process-count, wall-time, and log limits.
-Results are immutable records under `runs/<sample-sha256>/<profile>/` and never
-modify `sample.json`.
+Oracle profiles run in separate processes with resource limits and publish
+immutable run records. Campaigns generate deterministic recipes, materialize
+samples, track novelty, and optionally escalate through Rust, fsck, and Linux
+oracles.
 
 ```bash
 erofs-cli oracle run corpus/samples/sha256/HASH/sample.json \
   --profile rust-full
-erofs-cli oracle run corpus/samples/sha256/HASH/sample.json \
-  --profile fsck-full
-erofs-cli oracle run corpus/samples/sha256/HASH/sample.json \
-  --profile fsck-no-sbcrc
-erofs-cli oracle run corpus/samples/sha256/HASH/sample.json \
-  --profile linux-kasan --timeout-ms 80000
-```
 
-Profiles record complete argv, fixed environment, resource limits, binary and
-kernel/config/initramfs hashes, exit status, signal, wall time, bounded logs,
-classifier rule, phase, status, and stable signature.
-
-### Deterministic campaigns and minimization
-
-M4 records `chacha12/v1` recipes, deterministic field enumeration, dependency-aware
-combinations, byte/plan/result novelty identities, and a Rust → fsck → Linux
-escalation funnel with explicit sample, mutation, image, oracle, and wall-time
-budgets.
-
-```bash
 erofs-cli campaign run image.erofs --output-dir corpus --seed 17 \
   --field erofs.superblock.magic \
   --field erofs.superblock.fixed_nsec \
@@ -183,77 +139,75 @@ erofs-cli campaign run image.erofs --output-dir corpus --seed 17 \
 
 erofs-cli campaign minimize image.erofs --output-dir corpus \
   --recipe corpus/campaigns/CAMPAIGN/recipe.json --case CASE_ID \
-  --profile rust-full --signature rust:superblock_parse \
-  --confirmations 2
+  --profile rust-full --signature rust:superblock_parse --confirmations 2
 ```
 
-Minimization removes intent groups first, then shrinks field values, bit sets,
-raw patches, and truncate deltas. Every candidate regenerates integrity repair
-and must reproduce the same signature repeatedly in the same profile.
+Use `--no-tui` for script-friendly campaign output. The interactive dashboard
+is enabled automatically when a terminal is available.
 
-### Long-running metadata fuzzing demo
-
-`examples/metadata-fuzz.sh` repeatedly launches deterministic campaigns over
-superblock metadata: identity, feature flags, sizing, metadata/xattr placement,
-and extension fields. Rounds share a content-addressed corpus and novelty index;
-every generated mutation remains reproducible through its recorded recipe and
-sample manifest. The campaign dashboard is enabled automatically in a terminal.
+## Development and tests
 
 ```bash
-# Build the reader, fsck, kernel, and oracle artifacts for the novelty funnel.
-make all
-
-# Fuzz for one day into a resumable corpus.
-make fuzz
-
-# Seven-day run with a larger deterministic batch and full oracle escalation.
-make fuzz FUZZ_CORPUS=/srv/erofs-corpus \
-  FUZZ_ARGS='--duration-seconds 604800 --samples-per-round 8192 --funnel all'
-
-# Exactly ten generated cases, independent of their total execution time.
-make fuzz FUZZ_ARGS='--cases 10 --funnel all'
+git submodule update --init --depth 1
+cargo fmt --all --check
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-The Makefile entry point uses `build/rootfs.erofs` and
-`build/metadata-fuzz-corpus` by default. Override `FUZZ_IMAGE` or `FUZZ_CORPUS`,
-or invoke `examples/metadata-fuzz.sh` directly for the full interface.
+Use `make deps-check` to check host tools. `make all` builds the pinned kernel,
+initramfs, `mkfs.erofs`, and sample image; `make run` boots it in QEMU; `make
+smoke` runs the bounded boot check. These targets require the vendor submodules
+and system packages installed by `make apt-deps`.
 
-`make fuzz` reuses `build/linux/arch/x86/boot/bzImage`, `build/initramfs.cpio.gz`,
-`build/erofs-utils`, and `build/rootfs.erofs` when present. `make fuzz-prereqs`
-performs the same incremental check explicitly; it rebuilds the kernel only when
-its source or configuration has changed.
+## Metadata fuzzing
 
-Use `--funnel materialize-only` for high-throughput mutation generation without
-oracle execution, or `--no-tui` for logs and CI. Run the script with `--help`
-for all bounds and workspace options.
+The long-running demo in `examples/metadata-fuzz.sh` runs deterministic
+campaigns over superblock metadata. It stores recipes, reports, novelty state,
+and content-addressed samples under the corpus directory.
+
+```bash
+make all
+make fuzz --no-print-directory
+make fuzz FUZZ_CORPUS=/srv/erofs-corpus \
+  FUZZ_ARGS='--cases 10 --funnel all --no-tui'
+```
+
+The Makefile defaults to `build/rootfs.erofs` and
+`build/metadata-fuzz-corpus`. Run `examples/metadata-fuzz.sh --help` for all
+campaign bounds and workspace options. Use `--funnel materialize-only` when
+oracle execution is not required.
+
+## Supported layouts and limitations
+
+Implemented in the high-level reader:
+
+- Superblock, inode, and dirent parsing
+- Flat plain and flat inline layouts
+- Chunk-based layout without chunk indexes
+- Synchronous and asynchronous file reads
+- Directory walking and bounded traversal
+- Tar conversion with unsafe metadata checks
+
+Known limitations:
+
+- Compressed file data is not decoded by the high-level reader.
+- Chunk-based layouts using chunk indexes are not supported.
+- Extended-attribute data access is not exposed by the high-level reader.
+- Image creation is provided by the pinned `mkfs.erofs` workflow, not a Rust API.
+
+Unsupported layouts are rejected rather than partially decoded. The schema
+locator covers a broader ABI metadata surface than the high-level reader and
+does not imply support for every layout.
 
 ## Coverage
-
-Install [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov), then generate an LCOV report for the full workspace and enabled features:
 
 ```bash
 cargo install cargo-llvm-cov --locked
 make coverage
 ```
 
-The report is written to `target/lcov.info`. CI uploads the same report as the `lcov` artifact; it records coverage only and does not impose a line-coverage threshold. Metadata acceptance is enforced separately by locator schema-matrix tests.
-
-## Status
-
-### Implemented
-
-- [x] Superblock / inode / dirent parsing
-- [x] Flat plain layout, including bounded multi-block reads
-- [x] Flat inline layout, including exact-block-size files
-- [x] Chunk-based layout (without chunk indexes)
-- [x] Directory walk (`walk_dir`)
-- [x] Convert to tar archive
-
-### TODO
-
-- [ ] Extended attributes
-- [ ] Compressed data (lz4, lzma, deflate)
-- [ ] Image building (`mkfs.erofs` equivalent)
+The report is written to `target/lcov.info`. CI uploads the same report as the
+`lcov` artifact and does not impose a line-coverage threshold.
 
 ## License
 
