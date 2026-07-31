@@ -472,9 +472,10 @@ impl<'a, R: ReadAt> Locator<'a, R> {
 
     fn locate_device(&self, index: u16) -> Result<LocatedObject, LocateError<R::Error>> {
         if self.superblock.feature_incompat & FEATURE_INCOMPAT_DEVICE_TABLE == 0 {
-            return Err(LocateError::UnsupportedCapability(
-                Capability::ChunkDirectory,
-            ));
+            return Err(LocateError::AbsentByFeature {
+                field: "erofs.device.tag",
+                predicate: Predicate::WithDeviceTable,
+            });
         }
         if index >= self.superblock.extra_devices {
             return Err(LocateError::UnresolvedParent {
@@ -545,8 +546,12 @@ impl<'a, R: ReadAt> Locator<'a, R> {
         };
         let chunkbits = u32::from(self.superblock.blkszbits)
             + u32::from(chunk_format & crate::CHUNK_FORMAT_BLKBITS_MASK);
+        // blkszbits and the chunk-format blkbits are image controlled, so the
+        // chunk-size shift can exceed 63; fail instead of wrapping the shift.
+        let chunk_size = 1_u64.checked_shl(chunkbits).ok_or(LocateError::Overflow)?;
+        // The checked shift above proves chunkbits < 64, so this shift is safe.
         let chunks = size
-            .checked_add((1_u64 << chunkbits) - 1)
+            .checked_add(chunk_size - 1)
             .ok_or(LocateError::Overflow)?
             >> chunkbits;
         if index >= chunks {
@@ -600,7 +605,14 @@ impl<'a, R: ReadAt> Locator<'a, R> {
         index: u32,
     ) -> Result<LocatedObject, LocateError<R::Error>> {
         let (header, _, provenance, _) = self.locate_xattr_header(inode)?;
+        let (_, _, _, xattr_size) = self.inode_tail(inode)?;
         let count = u32::from(self.read_u8(header + 4)?);
+        if 12 + u64::from(count) * 4 > xattr_size {
+            return Err(LocateError::UnresolvedParent {
+                object: ObjectRef::SharedXattrId { inode, index },
+                reason: "shared xattr array exceeds inline region",
+            });
+        }
         if index >= count {
             return Err(LocateError::UnresolvedParent {
                 object: ObjectRef::SharedXattrId { inode, index },
@@ -682,8 +694,11 @@ impl<'a, R: ReadAt> Locator<'a, R> {
                 reason: "prefix index is outside xattr_prefix_count",
             });
         }
-        if self.superblock.feature_compat & 0x10 == 0 {
-            return Err(LocateError::UnsupportedCapability(Capability::Metabox));
+        if self.superblock.feature_incompat & FEATURE_INCOMPAT_XATTR_PREFIXES == 0 {
+            return Err(LocateError::AbsentByFeature {
+                field: "erofs.xattr.prefix.length",
+                predicate: Predicate::WithXattrPrefixes,
+            });
         }
         let mut pos = u64::from(self.superblock.xattr_prefix_start)
             .checked_mul(4)
@@ -693,7 +708,9 @@ impl<'a, R: ReadAt> Locator<'a, R> {
             pos = align_up(pos.checked_add(2 + len).ok_or(LocateError::Overflow)?, 4)?;
         }
         let len = metadata_length(self.read_u16(pos)?);
-        if len == 0 || len > 256 {
+        // A zero length word decodes to 65536 and is rejected by the > 256
+        // bound, so no explicit zero-length arm is needed here.
+        if len > 256 {
             return Err(LocateError::InvalidStructure {
                 object: ObjectRef::XattrLongPrefix { index },
                 reason: "invalid long-prefix payload length",
@@ -1240,6 +1257,61 @@ mod tests {
             Err(LocateError::Overflow)
         ));
     }
+    #[test]
+    fn chunk_size_shift_overflow_is_checked() {
+        let mut image = image();
+        image[1036] = 63;
+        image[1064..1068].copy_from_slice(&0_u32.to_le_bytes());
+        let inode = 3 * 32;
+        image[inode..inode + 2].copy_from_slice(&(LAYOUT_CHUNK << 1).to_le_bytes());
+        image[inode + 16..inode + 18].copy_from_slice(&(CHUNK_FORMAT_INDEXES | 1).to_le_bytes());
+        let reader = SliceReader::new(&image);
+        let locator = Locator::new(&reader).unwrap();
+        assert!(matches!(
+            locator.locate(
+                ObjectRef::Chunk { inode: 3, index: 0 },
+                field_by_id("erofs.chunk.device_id").unwrap()
+            ),
+            Err(LocateError::Overflow)
+        ));
+    }
+
+    #[test]
+    fn shared_xattr_array_is_bounded_by_inline_region() {
+        let mut image = image();
+        let inode = 4096 + 3 * 32;
+        image[inode..inode + 2].copy_from_slice(&0_u16.to_le_bytes());
+        image[inode + 2..inode + 4].copy_from_slice(&1_u16.to_le_bytes());
+        let header = inode + 32;
+        image[header + 4] = 1;
+        let reader = SliceReader::new(&image);
+        let locator = Locator::new(&reader).unwrap();
+        assert!(matches!(
+            locator.locate(
+                ObjectRef::SharedXattrId { inode: 3, index: 0 },
+                field_by_id("erofs.xattr.shared_id").unwrap()
+            ),
+            Err(LocateError::UnresolvedParent { .. })
+        ));
+    }
+
+    #[test]
+    fn xattr_prefix_requires_incompat_feature() {
+        let mut image = image();
+        image[1032..1036].copy_from_slice(&0x10_u32.to_le_bytes());
+        image[1115] = 1;
+        image[1116..1120].copy_from_slice(&800_u32.to_le_bytes());
+        let reader = SliceReader::new(&image);
+        let locator = Locator::new(&reader).unwrap();
+        assert!(matches!(
+            locator.locate(
+                ObjectRef::XattrLongPrefix { index: 0 },
+                field_by_id("erofs.xattr.prefix.length").unwrap()
+            ),
+            Err(LocateError::AbsentByFeature { .. })
+        ));
+    }
+
     #[test]
     fn locates_chunk_index_device_and_48bit_fields() {
         let mut image = image();
