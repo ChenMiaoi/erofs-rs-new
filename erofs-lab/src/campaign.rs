@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeSet,
     fs,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
@@ -26,6 +27,9 @@ const REPORT_SCHEMA: &str = "erofs-campaign-report/v1";
 const NOVELTY_SCHEMA: &str = "erofs-novelty-index/v1";
 const MINIMIZED_SCHEMA: &str = "erofs-minimized-recipe/v1";
 const PRNG: &str = "chacha12/v1";
+/// Furthest a persisted `case_offset` may skip into the PRNG combination
+/// stream; larger offsets are rejected instead of stalling generation.
+const MAX_CASE_SKIP: u64 = 1 << 20;
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
 /// Requests graceful campaign cancellation at the next safe interruption point.
@@ -376,20 +380,69 @@ pub fn generate_recipe(parent: &[u8], spec: CampaignSpec) -> Result<CampaignReci
             "campaign requires targets and sample budget",
         ));
     }
+    // The old materialize-then-drain scheme validated every target's field
+    // up front; keep that behavior even though generation is now lazy.
+    for target in &spec.targets {
+        field_by_id(&target.field)
+            .ok_or_else(|| Error::Resolve(format!("unknown field {}", target.field)))?;
+    }
     let seed = parse_u64(&spec.seed)?;
     let max_samples = usize::try_from(spec.budget.max_samples).map_err(|_| Error::Bounds)?;
-    let offset = usize::try_from(spec.case_offset).map_err(|_| Error::Bounds)?;
-    let requested = offset.checked_add(max_samples).ok_or(Error::Bounds)?;
-    let mut cases = deterministic_cases(&spec.targets, spec.integrity)?;
-    let remaining = requested.saturating_sub(cases.len());
-    cases.extend(combination_cases(
-        &spec.targets,
-        seed,
-        remaining,
-        spec.budget.max_mutations_per_sample,
-    )?);
-    cases.drain(..offset.min(cases.len()));
-    cases.truncate(max_samples);
+    // The combination tail is a PRNG stream, not an enumerable space; bound
+    // how far a persisted offset may skip into it so a hostile offset cannot
+    // stall generation.
+    if spec.case_offset > MAX_CASE_SKIP {
+        return Err(Error::Bounds);
+    }
+    let mut skip = spec.case_offset;
+    let mut cases = Vec::with_capacity(max_samples.min(4096));
+
+    // Skip deterministic cases by advancing the descriptor cursor only; no
+    // `RecipeCase` is built for a skipped case.
+    let mut deterministic = DeterministicCases::new(&spec.targets);
+    let mut deterministic_total = 0_u64;
+    while skip > 0 {
+        if deterministic.next_descriptor()?.is_none() {
+            break;
+        }
+        deterministic_total += 1;
+        skip -= 1;
+    }
+    while cases.len() < max_samples {
+        let Some((target, kind)) = deterministic.next_descriptor()? else {
+            break;
+        };
+        deterministic_total += 1;
+        cases.push(deterministic_case(target, kind, spec.integrity)?);
+    }
+
+    if cases.len() < max_samples
+        && let Some(mut stream) =
+            CombinationStream::new(&spec.targets, seed, spec.budget.max_mutations_per_sample)?
+    {
+        // Total stream iterations the previous materialize-then-drain
+        // scheme would have performed; skipping draws from the same
+        // budget, and only non-empty cases count toward the offset.
+        let requested = spec.case_offset.saturating_add(spec.budget.max_samples);
+        let mut iterations = requested.saturating_sub(deterministic_total);
+        while skip > 0 && iterations > 0 {
+            iterations -= 1;
+            if !stream.draw()?.is_empty() {
+                skip -= 1;
+            }
+        }
+        while cases.len() < max_samples && iterations > 0 {
+            iterations -= 1;
+            let intents = stream.draw()?;
+            if !intents.is_empty() {
+                cases.push(case(
+                    "dependency-combination",
+                    &intents,
+                    SeedExpectation::Exploratory,
+                )?);
+            }
+        }
+    }
     Ok(CampaignRecipe {
         schema: RECIPE_SCHEMA.into(),
         prng: PRNG.into(),
@@ -451,6 +504,12 @@ where
     let novelty_path = corpus.join("novelty.json");
     let mut novelty = load_novelty(&novelty_path)?;
     let start = Instant::now();
+    // The wall clock budget gates every oracle profile launch, not just the
+    // space between cases.
+    let wall_over_budget = || {
+        recipe.spec.budget.wall_time_ms != 0
+            && start.elapsed() > Duration::from_millis(recipe.spec.budget.wall_time_ms)
+    };
     let mut oracle_runs = 0_u64;
     let mut materialized = 0_u64;
     let mut reports = Vec::new();
@@ -484,36 +543,46 @@ where
             completed_case: None,
         });
         let intents = resolve_intents(&case.intents)?;
-        let resolved = match plan(&parent, &intents, recipe.spec.mode, recipe.spec.integrity) {
-            Ok(plan) => plan,
-            Err(error) => {
-                reports.push(CampaignCaseReport {
-                    case_id: case.id.clone(),
-                    sample_sha256: None,
-                    plan_sha256: None,
-                    duplicate_bytes: false,
-                    duplicate_plan: false,
-                    planning_error: Some(error.to_string()),
-                    oracle_results: Vec::new(),
-                    expectation: case.expectation,
-                    expectation_mismatch: false,
-                });
-                report_progress(
+        // A panic while planning one case must not abort the whole campaign;
+        // record it as a case-level planning error instead.
+        let planned = catch_unwind(AssertUnwindSafe(|| {
+            plan(&parent, &intents, recipe.spec.mode, recipe.spec.integrity).and_then(|resolved| {
+                apply_resolved_plan(&parent, &resolved).map(|bytes| (resolved, bytes))
+            })
+        }));
+        let (resolved, output_bytes) = match planned {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(error)) => {
+                report_planning_failure(
                     &mut progress,
                     total_cases,
-                    &reports,
+                    &mut reports,
                     materialized,
                     oracle_runs,
                     start.elapsed(),
                     recipe.spec.budget.wall_time_ms,
-                    CampaignPhase::Complete,
                     case,
+                    error.to_string(),
+                );
+                continue;
+            }
+            Err(payload) => {
+                report_planning_failure(
+                    &mut progress,
+                    total_cases,
+                    &mut reports,
+                    materialized,
+                    oracle_runs,
+                    start.elapsed(),
+                    recipe.spec.budget.wall_time_ms,
+                    case,
+                    format!("panic during case planning: {}", panic_message(&*payload)),
                 );
                 continue;
             }
         };
         let duplicate_plan = !novelty.plan_sha256.insert(resolved.plan_sha256.clone());
-        let output_sha256 = sha256(&apply_resolved_plan(&parent, &resolved)?);
+        let output_sha256 = sha256(&output_bytes);
         let duplicate_bytes = !novelty.byte_sha256.insert(output_sha256.clone());
         if duplicate_bytes {
             reports.push(CampaignCaseReport {
@@ -555,10 +624,33 @@ where
             expectation_mismatch: false,
             completed_case: None,
         });
-        let sample = materialize(parent_path, corpus, &resolved)?;
+        // Materialization panics are contained the same way as planning
+        // panics; ordinary I/O errors still abort the campaign as before.
+        let sample = match catch_unwind(AssertUnwindSafe(|| {
+            materialize(parent_path, corpus, &resolved)
+        })) {
+            Ok(result) => result?,
+            Err(payload) => {
+                report_planning_failure(
+                    &mut progress,
+                    total_cases,
+                    &mut reports,
+                    materialized,
+                    oracle_runs,
+                    start.elapsed(),
+                    recipe.spec.budget.wall_time_ms,
+                    case,
+                    format!(
+                        "panic during case materialization: {}",
+                        panic_message(&*payload)
+                    ),
+                );
+                continue;
+            }
+        };
         materialized += 1;
         let mut identities = Vec::new();
-        if recipe.spec.funnel != FunnelPolicy::MaterializeOnly {
+        if recipe.spec.funnel != FunnelPolicy::MaterializeOnly && !wall_over_budget() {
             let paths =
                 oracle_paths.ok_or(Error::Unsupported("oracle paths required by funnel"))?;
             progress(CampaignProgress {
@@ -588,7 +680,10 @@ where
                         | OracleStatus::ResourceExhausted
                 )
                 || (rust.result.status == OracleStatus::Rejected && seeded_retention(&case.id));
-            if must_escalate && oracle_runs < recipe.spec.budget.max_oracle_runs {
+            if must_escalate
+                && oracle_runs < recipe.spec.budget.max_oracle_runs
+                && !wall_over_budget()
+            {
                 progress(CampaignProgress {
                     total_cases,
                     completed_cases: reports.len(),
@@ -618,6 +713,7 @@ where
                             | OracleStatus::ResourceExhausted
                     ))
                     && oracle_runs < recipe.spec.budget.max_oracle_runs
+                    && !wall_over_budget()
                 {
                     progress(CampaignProgress {
                         total_cases,
@@ -664,6 +760,10 @@ where
             CampaignPhase::Complete,
             case,
         );
+        if wall_over_budget() {
+            stopped_reason = "wall_time".into();
+            break;
+        }
         if oracle_runs >= recipe.spec.budget.max_oracle_runs
             && recipe.spec.funnel != FunnelPolicy::MaterializeOnly
         {
@@ -689,6 +789,7 @@ where
         result: report,
     })
 }
+#[allow(clippy::too_many_arguments)]
 fn report_progress<F>(
     progress: &mut F,
     total_cases: usize,
@@ -719,6 +820,54 @@ fn report_progress<F>(
             .is_some_and(|report| report.expectation_mismatch),
         completed_case: reports.last(),
     });
+}
+
+/// Records a case-level planning failure and reports the completed case.
+#[allow(clippy::too_many_arguments)]
+fn report_planning_failure<F>(
+    progress: &mut F,
+    total_cases: usize,
+    reports: &mut Vec<CampaignCaseReport>,
+    samples_materialized: u64,
+    oracle_runs: u64,
+    elapsed: Duration,
+    wall_time_ms: u64,
+    case: &RecipeCase,
+    message: String,
+) where
+    F: FnMut(CampaignProgress<'_>),
+{
+    reports.push(CampaignCaseReport {
+        case_id: case.id.clone(),
+        sample_sha256: None,
+        plan_sha256: None,
+        duplicate_bytes: false,
+        duplicate_plan: false,
+        planning_error: Some(message),
+        oracle_results: Vec::new(),
+        expectation: case.expectation,
+        expectation_mismatch: false,
+    });
+    report_progress(
+        progress,
+        total_cases,
+        reports,
+        samples_materialized,
+        oracle_runs,
+        elapsed,
+        wall_time_ms,
+        CampaignPhase::Complete,
+        case,
+    );
+}
+
+/// Extracts a human-readable message from a caught panic payload.
+fn panic_message(payload: &dyn std::any::Any) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".into())
 }
 
 /// Inputs for one signature-preserving minimization run.
@@ -846,79 +995,166 @@ pub fn minimize_case(request: MinimizeRequest<'_>) -> Result<PathBuf, Error> {
     write_json_replace(&path, &output)?;
     Ok(path)
 }
-fn deterministic_cases(
-    targets: &[CampaignTarget],
+/// One deterministic case slot: a boundary value or a single-bit flip.
+enum DeterministicKind {
+    Value(u64),
+    Bit(u64),
+}
+
+/// Enumerates deterministic case descriptors by index without materializing
+/// `RecipeCase` structs, so skipping a case offset is O(1) per skipped case.
+struct DeterministicCases<'a> {
+    targets: &'a [CampaignTarget],
+    current: Option<&'a CampaignTarget>,
+    next_target: usize,
+    values: Vec<u64>,
+    value_index: usize,
+    bit: u64,
+    bit_count: u64,
+}
+
+impl<'a> DeterministicCases<'a> {
+    fn new(targets: &'a [CampaignTarget]) -> Self {
+        Self {
+            targets,
+            current: None,
+            next_target: 0,
+            values: Vec::new(),
+            value_index: 0,
+            bit: 0,
+            bit_count: 0,
+        }
+    }
+
+    fn advance_target(&mut self) -> Result<bool, Error> {
+        while self.next_target < self.targets.len() {
+            let target = &self.targets[self.next_target];
+            self.next_target += 1;
+            let field = field_by_id(&target.field)
+                .ok_or_else(|| Error::Resolve(format!("unknown field {}", target.field)))?;
+            if field.encoding == Encoding::Bytes {
+                continue;
+            }
+            let max = width_max(field.storage.len)?;
+            let mut values = vec![0, max, 1];
+            if max > 0 {
+                values.push(max - 1);
+            }
+            values.sort_unstable();
+            values.dedup();
+            self.values = values;
+            self.value_index = 0;
+            self.bit = 0;
+            self.bit_count = field.storage.len * 8;
+            self.current = Some(target);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Returns the next descriptor, advancing the enumeration by one case.
+    fn next_descriptor(
+        &mut self,
+    ) -> Result<Option<(&'a CampaignTarget, DeterministicKind)>, Error> {
+        loop {
+            let Some(target) = self.current else {
+                if !self.advance_target()? {
+                    return Ok(None);
+                }
+                continue;
+            };
+            if self.value_index < self.values.len() {
+                let value = self.values[self.value_index];
+                self.value_index += 1;
+                return Ok(Some((target, DeterministicKind::Value(value))));
+            }
+            if self.bit < self.bit_count {
+                let bit = self.bit;
+                self.bit += 1;
+                return Ok(Some((target, DeterministicKind::Bit(bit))));
+            }
+            self.current = None;
+        }
+    }
+}
+
+/// Materializes one deterministic case from its descriptor.
+fn deterministic_case(
+    target: &CampaignTarget,
+    kind: DeterministicKind,
     integrity: IntegrityPolicy,
-) -> Result<Vec<RecipeCase>, Error> {
-    let mut cases = Vec::new();
-    for target in targets {
-        let field = field_by_id(&target.field)
-            .ok_or_else(|| Error::Resolve(format!("unknown field {}", target.field)))?;
-        if field.encoding == Encoding::Bytes {
-            continue;
-        }
-        let max = width_max(field.storage.len)?;
-        let mut values = vec![0, max, 1];
-        if max > 0 {
-            values.push(max - 1);
-        }
-        values.sort_unstable();
-        values.dedup();
-        for value in values {
+) -> Result<RecipeCase, Error> {
+    match kind {
+        DeterministicKind::Value(value) => {
             let intents = vec![RecipeIntent::SetValue {
                 object: target.object.clone(),
                 field: target.field.clone(),
                 value: value.to_string(),
             }];
-            cases.push(case(
+            case(
                 "enumerate-value",
                 &intents,
                 expectation_for_value(&target.field, value, integrity),
-            )?);
+            )
         }
-        for bit in 0..field.storage.len * 8 {
+        DeterministicKind::Bit(bit) => {
             let intents = vec![RecipeIntent::UpdateBits {
                 object: target.object.clone(),
                 field: target.field.clone(),
                 set: (1_u64 << bit).to_string(),
                 clear: "0".into(),
             }];
-            cases.push(case(
+            case(
                 "enumerate-bit",
                 &intents,
                 expectation_for_bit(&target.field),
-            )?);
+            )
         }
     }
-    Ok(cases)
 }
 
-fn combination_cases(
-    targets: &[CampaignTarget],
-    seed: u64,
-    count: usize,
-    max_mutations: u64,
-) -> Result<Vec<RecipeCase>, Error> {
-    let mut seed_bytes = [0; 32];
-    seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
-    seed_bytes[8..16].copy_from_slice(&(!seed).to_le_bytes());
-    let mut rng = ChaCha12Rng::from_seed(seed_bytes);
-    let max = usize::try_from(max_mutations)
-        .map_err(|_| Error::Bounds)?
-        .min(targets.len());
-    if max == 0 {
-        return Ok(Vec::new());
+/// ChaCha-seeded combination case stream. Skipping advances the PRNG through
+/// the exact draw pattern of each skipped case without building `RecipeCase`
+/// structs, preserving window equivalence with an offset of zero.
+struct CombinationStream<'a> {
+    rng: ChaCha12Rng,
+    targets: &'a [CampaignTarget],
+    max: usize,
+}
+
+impl<'a> CombinationStream<'a> {
+    fn new(
+        targets: &'a [CampaignTarget],
+        seed: u64,
+        max_mutations: u64,
+    ) -> Result<Option<Self>, Error> {
+        let max = usize::try_from(max_mutations)
+            .map_err(|_| Error::Bounds)?
+            .min(targets.len());
+        if max == 0 {
+            return Ok(None);
+        }
+        let mut seed_bytes = [0; 32];
+        seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        seed_bytes[8..16].copy_from_slice(&(!seed).to_le_bytes());
+        Ok(Some(Self {
+            rng: ChaCha12Rng::from_seed(seed_bytes),
+            targets,
+            max,
+        }))
     }
-    let mut cases = Vec::new();
-    for _ in 0..count {
-        let mutations = 1 + (rng.next_u64() as usize % max);
+
+    /// Advances the stream by one case and returns its intents, which may be
+    /// empty when every selected field is byte-encoded.
+    fn draw(&mut self) -> Result<Vec<RecipeIntent>, Error> {
+        let mutations = 1 + (self.rng.next_u64() as usize % self.max);
         let mut selected = BTreeSet::new();
         while selected.len() < mutations {
-            selected.insert(rng.next_u64() as usize % targets.len());
+            selected.insert(self.rng.next_u64() as usize % self.targets.len());
         }
         let mut intents = Vec::new();
         for index in selected {
-            let target = &targets[index];
+            let target = &self.targets[index];
             let field = field_by_id(&target.field)
                 .ok_or_else(|| Error::Resolve(format!("unknown field {}", target.field)))?;
             if field.encoding == Encoding::Bytes {
@@ -927,18 +1163,11 @@ fn combination_cases(
             intents.push(RecipeIntent::SetValue {
                 object: target.object.clone(),
                 field: target.field.clone(),
-                value: (rng.next_u64() & width_max(field.storage.len)?).to_string(),
+                value: (self.rng.next_u64() & width_max(field.storage.len)?).to_string(),
             });
         }
-        if !intents.is_empty() {
-            cases.push(case(
-                "dependency-combination",
-                &intents,
-                SeedExpectation::Exploratory,
-            )?);
-        }
+        Ok(intents)
     }
-    Ok(cases)
 }
 
 fn expectation_for_value(field: &str, value: u64, integrity: IntegrityPolicy) -> SeedExpectation {
@@ -996,15 +1225,10 @@ fn run_profile(
     sample: &PublishedSample,
     profile: OracleProfile,
     paths: &OraclePaths,
-    mut limits: ResourceLimits,
+    limits: ResourceLimits,
 ) -> Result<PublishedRun, Error> {
-    if profile == OracleProfile::LinuxKasan {
-        limits.timeout_ms = limits.timeout_ms.max(80_000);
-        limits.cpu_seconds = limits.cpu_seconds.max(80);
-        limits.address_space_bytes = limits.address_space_bytes.max(3 << 30);
-        limits.processes = limits.processes.max(64);
-        limits.output_bytes = limits.output_bytes.max(8 << 20);
-    }
+    // run_oracle applies the Linux KASAN resource floors itself and records
+    // both the requested and the effective limits in the run record.
     run_oracle(&sample.manifest, profile, paths, limits)
 }
 
@@ -1178,7 +1402,25 @@ fn load_novelty(path: &Path) -> Result<NoveltyIndex, Error> {
     }
 }
 fn save_novelty(path: &Path, novelty: &NoveltyIndex) -> Result<(), Error> {
-    write_json_replace(path, novelty)
+    // Merge with whatever a concurrent campaign persisted while this one was
+    // running instead of blindly overwriting it. Identity sets only ever
+    // grow, so a union loses nothing; the in-memory schema wins on conflict.
+    let mut merged = load_novelty(path).unwrap_or_else(|_| NoveltyIndex {
+        schema: NOVELTY_SCHEMA.into(),
+        ..NoveltyIndex::default()
+    });
+    merged.schema = novelty.schema.clone();
+    merged
+        .byte_sha256
+        .extend(novelty.byte_sha256.iter().cloned());
+    merged
+        .plan_sha256
+        .extend(novelty.plan_sha256.iter().cloned());
+    merged.results.extend(novelty.results.iter().cloned());
+    merged
+        .coverage_sha256
+        .extend(novelty.coverage_sha256.iter().cloned());
+    write_json_replace(path, &merged)
 }
 fn write_json_once<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
     let bytes = serde_json::to_vec(value)?;
@@ -1387,5 +1629,58 @@ mod tests {
         assert!(novelty.plan_sha256.insert("plan-a".into()));
         assert!(!novelty.byte_sha256.insert("bytes".into()));
         assert!(novelty.plan_sha256.insert("plan-b".into()));
+    }
+
+    #[test]
+    fn case_offset_window_matches_zero_offset_prefix() {
+        let parent = image();
+        let mut baseline_spec = spec(3);
+        baseline_spec.budget.max_samples = 50;
+        let baseline = generate_recipe(&parent, baseline_spec).unwrap();
+        assert_eq!(baseline.cases.len(), 50);
+        let mut windowed = spec(3);
+        windowed.case_offset = 40;
+        windowed.budget.max_samples = 10;
+        let window = generate_recipe(&parent, windowed).unwrap();
+        assert_eq!(window.cases, baseline.cases[40..50]);
+    }
+
+    #[test]
+    fn hostile_case_offset_is_rejected() {
+        let parent = image();
+        let mut hostile = spec(5);
+        hostile.case_offset = u64::MAX;
+        assert!(matches!(
+            generate_recipe(&parent, hostile),
+            Err(Error::Bounds)
+        ));
+    }
+
+    #[test]
+    fn save_novelty_merges_with_concurrent_on_disk_state() {
+        let path = std::env::temp_dir().join(format!(
+            "erofs-lab-novelty-test-{}-{:x}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut on_disk = NoveltyIndex {
+            schema: NOVELTY_SCHEMA.into(),
+            ..NoveltyIndex::default()
+        };
+        on_disk.byte_sha256.insert("disk-only".into());
+        fs::write(&path, serde_json::to_vec(&on_disk).unwrap()).unwrap();
+        let mut memory = NoveltyIndex {
+            schema: NOVELTY_SCHEMA.into(),
+            ..NoveltyIndex::default()
+        };
+        memory.byte_sha256.insert("memory-only".into());
+        save_novelty(&path, &memory).unwrap();
+        let merged: NoveltyIndex = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(merged.byte_sha256.contains("disk-only"));
+        assert!(merged.byte_sha256.contains("memory-only"));
+        let _ = fs::remove_file(&path);
     }
 }

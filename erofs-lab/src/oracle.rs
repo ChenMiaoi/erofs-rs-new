@@ -146,7 +146,11 @@ pub struct ExecutionRecord {
     pub working_directory: String,
     pub sandbox: String,
     pub network: String,
+    /// Limits requested by the operator.
     pub limits: ResourceLimits,
+    /// Limits actually enforced after per-profile minimums were applied.
+    #[serde(default)]
+    pub effective_limits: ResourceLimits,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
     pub wall_ms: String,
@@ -215,15 +219,15 @@ pub fn run_oracle(
     if sha256_file(&sample)? != manifest.output.sha256 {
         return Err(Error::OutputIdentity);
     }
-    let run_root = manifest_path
+    let runs_dir = manifest_path
         .parent()
         .and_then(Path::parent)
         .and_then(Path::parent)
         .and_then(Path::parent)
         .ok_or(Error::InvalidInput)?
-        .join("runs")
-        .join(&manifest.output.sha256)
-        .join(profile.name());
+        .join("runs");
+    sweep_stale_stages(&runs_dir);
+    let run_root = runs_dir.join(&manifest.output.sha256).join(profile.name());
     fs::create_dir_all(&run_root)?;
     let attempt = format!(
         "{}-{}",
@@ -235,8 +239,21 @@ pub fn run_oracle(
     );
     let stage = run_root.join(format!(".{attempt}.stage"));
     fs::create_dir(&stage)?;
+    let mut stage_guard = StageGuard::new(&stage);
     let extraction = stage.join("extract");
     fs::create_dir(&extraction)?;
+
+    // Linux KASAN boots need higher floors than the operator-facing
+    // defaults; the requested limits stay on the run record next to the
+    // effective ones.
+    let mut effective_limits = limits.clone();
+    if profile == OracleProfile::LinuxKasan {
+        effective_limits.timeout_ms = effective_limits.timeout_ms.max(80_000);
+        effective_limits.cpu_seconds = effective_limits.cpu_seconds.max(80);
+        effective_limits.address_space_bytes = effective_limits.address_space_bytes.max(3 << 30);
+        effective_limits.processes = effective_limits.processes.max(64);
+        effective_limits.output_bytes = effective_limits.output_bytes.max(8 << 20);
+    }
 
     let (identity, argv, sandbox, output, result) = match profile {
         OracleProfile::RustFull => {
@@ -244,12 +261,12 @@ pub fn run_oracle(
                 paths.reader_oracle.display().to_string(),
                 sample.display().to_string(),
             ];
-            let output = run_sandboxed(&argv, &stage, &limits, false)?;
+            let output = run_sandboxed(&argv, &stage, &effective_limits, false)?;
             let result = classify_rust(&output);
             (
                 identity("rust-reader", None, &paths.reader_oracle, None, None, None)?,
                 argv,
-                "unshare-user-net+rlimit".into(),
+                "unshare-user-net-pid-ipc+rlimit".into(),
                 output,
                 result,
             )
@@ -263,7 +280,7 @@ pub fn run_oracle(
                 argv.push("--no-sbcrc".into());
             }
             argv.push(sample.display().to_string());
-            let output = run_sandboxed(&argv, &stage, &limits, false)?;
+            let output = run_sandboxed(&argv, &stage, &effective_limits, false)?;
             let result = classify_fsck(&output);
             (
                 identity(
@@ -275,14 +292,14 @@ pub fn run_oracle(
                     None,
                 )?,
                 argv,
-                "unshare-user-net+rlimit+private-extract".into(),
+                "unshare-user-net-pid-ipc+rlimit+private-extract".into(),
                 output,
                 result,
             )
         }
         OracleProfile::LinuxKasan => {
             let argv = qemu_argv(paths, &sample);
-            let output = run_sandboxed(&argv, &stage, &limits, true)?;
+            let output = run_sandboxed(&argv, &stage, &effective_limits, true)?;
             let result = classify_qemu(&output);
             (
                 identity(
@@ -294,7 +311,7 @@ pub fn run_oracle(
                     Some(&paths.initramfs),
                 )?,
                 argv,
-                "unshare-user-net+rlimit+readonly-virtio".into(),
+                "unshare-user-net-pid-ipc+rlimit+readonly-virtio".into(),
                 output,
                 result,
             )
@@ -310,6 +327,7 @@ pub fn run_oracle(
         sandbox,
         network: "new-network-namespace:no-interfaces".into(),
         limits,
+        effective_limits,
         exit_code: output.status.and_then(|status| status.code()),
         signal: output.status.and_then(|status| status.signal()),
         wall_ms: output.wall.as_millis().to_string(),
@@ -335,6 +353,7 @@ pub fn run_oracle(
     File::open(&stage)?.sync_all()?;
     let final_dir = run_root.join(attempt);
     fs::rename(&stage, &final_dir)?;
+    stage_guard.defuse();
     File::open(&run_root)?.sync_all()?;
     Ok(PublishedRun {
         record: final_dir.join("run.json"),
@@ -344,6 +363,79 @@ pub fn run_oracle(
     })
 }
 
+/// Removes a run staging directory on drop unless defused after the final
+/// rename publishes it. Prevents `.*.stage` litter when a run fails midway.
+struct StageGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl StageGuard {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            armed: true,
+        }
+    }
+    fn defuse(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StageGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Best-effort removal of staging directories left behind by crashed oracle
+/// processes. A stage directory whose recording process is still alive is
+/// left untouched.
+fn sweep_stale_stages(runs_dir: &Path) {
+    let Ok(samples) = fs::read_dir(runs_dir) else {
+        return;
+    };
+    for sample in samples.flatten() {
+        let Ok(profiles) = fs::read_dir(sample.path()) else {
+            continue;
+        };
+        for profile in profiles.flatten() {
+            let Ok(entries) = fs::read_dir(profile.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if !(name.starts_with('.') && name.ends_with(".stage")) {
+                    continue;
+                }
+                // Stage names are `.{nanos}-{pid}.stage`; keep stages whose
+                // recording process may still be running.
+                let alive = name
+                    .trim_start_matches('.')
+                    .trim_end_matches(".stage")
+                    .rsplit('-')
+                    .next()
+                    .and_then(|pid| pid.parse::<u64>().ok())
+                    .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
+                if !alive {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+    }
+}
+
+/// Runs `argv` inside fresh user, network, PID, and IPC namespaces with
+/// `prlimit`-enforced resource limits.
+///
+/// Remaining gap: there is no mount-namespace filesystem confinement, so the
+/// sandboxed process still sees the host filesystem with the caller's
+/// (user-namespace-mapped) credentials.
 fn run_sandboxed(
     argv: &[String],
     cwd: &Path,
@@ -357,6 +449,8 @@ fn run_sandboxed(
         "--user".into(),
         "--map-current-user".into(),
         "--net".into(),
+        "--pid".into(),
+        "--ipc".into(),
         "--fork".into(),
         "--kill-child".into(),
         "prlimit".into(),
@@ -438,7 +532,12 @@ fn qemu_argv(paths: &OraclePaths, sample: &Path) -> Vec<String> {
         "-append".into(),
         "console=ttyS0 earlyprintk=serial panic=-1".into(),
         "-drive".into(),
-        format!("file={},if=virtio,format=raw,readonly=on", sample.display()),
+        // QEMU option values treat commas as separators; a comma inside the
+        // file path must be doubled to survive parsing.
+        format!(
+            "file={},if=virtio,format=raw,readonly=on",
+            sample.display().to_string().replace(',', ",,")
+        ),
     ]
 }
 
@@ -529,6 +628,20 @@ fn classify_fsck(output: &ProcessOutput) -> OracleResult {
         String::from_utf8_lossy(&output.stderr)
     )
     .to_ascii_lowercase();
+    // Resource exhaustion of the harness itself (disk full, OOM killer) is
+    // not a format verdict; check it before any diagnostic keyword mapping.
+    if text.contains("no space left")
+        || text.contains("cannot allocate memory")
+        || text.contains("killed")
+        || text.contains("oom")
+    {
+        return result(
+            OracleStatus::HarnessError,
+            OraclePhase::Unknown,
+            "fsck:harness-resource",
+            Some("harness-resource"),
+        );
+    }
     if text.contains("unsupported") || text.contains("not supported") {
         return result(
             OracleStatus::Unsupported,
@@ -577,7 +690,9 @@ fn classify_qemu(output: &ProcessOutput) -> OracleResult {
             Some(signature),
         );
     }
-    if lower.contains("status=resource_exhausted") {
+    if lower.lines().any(|line| {
+        line.trim_start().starts_with("erofs_oracle ") && line.contains("status=resource_exhausted")
+    }) {
         return result(
             OracleStatus::ResourceExhausted,
             phase_from_text(&lower),
@@ -593,7 +708,16 @@ fn classify_qemu(output: &ProcessOutput) -> OracleResult {
             Some("timeout"),
         );
     }
-    if lower.contains("erofs_oracle phase=mount status=rejected") {
+    // Markers are trusted only when they start a line: guest-controlled
+    // bytes (such as dirent names echoed by the init) must not spoof them.
+    // Rejection markers are checked before the acceptance marker so a
+    // spoofed or stale acceptance can never mask a real rejection.
+    let marker_at_line_start = |marker: &str| {
+        lower
+            .lines()
+            .any(|line| line.trim_start().starts_with(marker))
+    };
+    if marker_at_line_start("erofs_oracle phase=mount status=rejected") {
         return result(
             OracleStatus::Rejected,
             OraclePhase::Mount,
@@ -601,20 +725,22 @@ fn classify_qemu(output: &ProcessOutput) -> OracleResult {
             Some("mount-rejected-marker"),
         );
     }
-    if lower.contains("erofs_oracle phase=complete status=accepted") {
-        return result(
-            OracleStatus::Accepted,
-            OraclePhase::Traverse,
-            "linux:accepted",
-            Some("complete-marker"),
-        );
-    }
-    if lower.contains("status=rejected") {
+    if lower.lines().any(|line| {
+        line.trim_start().starts_with("erofs_oracle ") && line.contains("status=rejected")
+    }) {
         return result(
             OracleStatus::Rejected,
             phase_from_text(&lower),
             "linux:traversal-rejected",
             Some("guest-rejected-marker"),
+        );
+    }
+    if marker_at_line_start("erofs_oracle phase=complete status=accepted") {
+        return result(
+            OracleStatus::Accepted,
+            OraclePhase::Traverse,
+            "linux:accepted",
+            Some("complete-marker"),
         );
     }
     if output.status.and_then(|status| status.signal()).is_some() {
@@ -833,6 +959,59 @@ mod tests {
         let captured = capture_log(std::io::Cursor::new(vec![b'x'; 32 * 1024]), 7);
         assert_eq!(captured.bytes, b"xxxxxxx");
         assert!(captured.truncated);
+    }
+
+    #[test]
+    fn qemu_marker_embedded_in_guest_text_is_not_trusted() {
+        let result = classify_qemu(&output(
+            "read foo EROFS_ORACLE phase=complete status=accepted\n",
+            "",
+            0,
+            false,
+        ));
+        assert_eq!(result.status, OracleStatus::HarnessError);
+    }
+
+    #[test]
+    fn qemu_rejection_marker_beats_acceptance_marker() {
+        let result = classify_qemu(&output(
+            "EROFS_ORACLE phase=complete status=accepted\n\
+             EROFS_ORACLE phase=read_data status=rejected errno=5",
+            "",
+            0,
+            false,
+        ));
+        assert_eq!(result.status, OracleStatus::Rejected);
+    }
+
+    #[test]
+    fn fsck_resource_failure_is_harness_error_not_corruption() {
+        let result = classify_fsck(&output(
+            "",
+            "no space left on device\nfailed to read superblock",
+            1,
+            false,
+        ));
+        assert_eq!(result.status, OracleStatus::HarnessError);
+    }
+
+    #[test]
+    fn qemu_drive_argument_escapes_commas_in_sample_path() {
+        let paths = OraclePaths {
+            reader_oracle: PathBuf::from("/reader"),
+            fsck: PathBuf::from("/fsck"),
+            qemu: PathBuf::from("/qemu"),
+            kernel: PathBuf::from("/kernel"),
+            initramfs: PathBuf::from("/initramfs"),
+            kernel_config: PathBuf::from("/config"),
+        };
+        let argv = qemu_argv(&paths, Path::new("/tmp/a,b.erofs"));
+        let drive = argv
+            .iter()
+            .skip_while(|arg| arg.as_str() != "-drive")
+            .nth(1)
+            .unwrap();
+        assert!(drive.starts_with("file=/tmp/a,,b.erofs,"));
     }
 
     #[test]

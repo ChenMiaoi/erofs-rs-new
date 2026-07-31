@@ -36,25 +36,29 @@ classify_dmesg() {
         return
     fi
 
-    # 2. Expected clean rejection.
-    if grep -q "EROFS_ORACLE phase=mount status=rejected" "$dmesg_path"; then
+    # 2. Expected clean rejection at mount time.
+    #    Markers are anchored to line starts so guest-controlled bytes (for
+    #    example dirent names echoed by the init) cannot spoof them mid-line.
+    if grep -q "^EROFS_ORACLE phase=mount status=rejected" "$dmesg_path"; then
         REPLAY_RESULT="REJECTED"
         REPLAY_MSG="mount rejected cleanly"
         return
     fi
 
-    # 3. Acceptance is committed only after complete traversal and EOF reads.
-    if grep -q "EROFS_ORACLE phase=complete status=accepted" "$dmesg_path"; then
-        REPLAY_RESULT="ACCEPTED"
-        REPLAY_MSG=$(grep "EROFS_ORACLE phase=traverse status=accepted" "$dmesg_path" | tail -1)
-        [[ -z "$REPLAY_MSG" ]] && REPLAY_MSG="mounted and traversed successfully"
+    # 3. A guest-side traversal/read failure is a clean format rejection.
+    #    Checked BEFORE the acceptance marker: a spoofed or stale acceptance
+    #    must never mask a real rejection.
+    if grep -qE "^EROFS_ORACLE phase=(readdir|inode|read_data|traverse) status=rejected" "$dmesg_path"; then
+        REPLAY_RESULT="REJECTED"
+        REPLAY_MSG=$(grep -E "^EROFS_ORACLE phase=(readdir|inode|read_data|traverse) status=rejected" "$dmesg_path" | tail -1)
         return
     fi
 
-    # 4. A guest-side traversal/read failure is a clean format rejection.
-    if grep -qE "EROFS_ORACLE phase=(readdir|inode|read_data|traverse) status=rejected" "$dmesg_path"; then
-        REPLAY_RESULT="REJECTED"
-        REPLAY_MSG=$(grep -E "EROFS_ORACLE phase=(readdir|inode|read_data|traverse) status=rejected" "$dmesg_path" | tail -1)
+    # 4. Acceptance is committed only after complete traversal and EOF reads.
+    if grep -q "^EROFS_ORACLE phase=complete status=accepted" "$dmesg_path"; then
+        REPLAY_RESULT="ACCEPTED"
+        REPLAY_MSG=$(grep "^EROFS_ORACLE phase=traverse status=accepted" "$dmesg_path" | tail -1)
+        [[ -z "$REPLAY_MSG" ]] && REPLAY_MSG="mounted and traversed successfully"
         return
     fi
 

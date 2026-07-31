@@ -41,7 +41,8 @@ struct Stats {
 }
 
 fn run(path: &str) -> Result<Stats, (&'static str, &'static str)> {
-    let image = MmapImage::new_from_path(path).map_err(|_| ("open", "image_open"))?;
+    // SAFETY: image file is not modified while mapped
+    let image = unsafe { MmapImage::new_from_path(path) }.map_err(|_| ("open", "image_open"))?;
     let fs = EroFS::new(image).map_err(|_| ("superblock", "superblock_parse"))?;
     let mut stats = Stats::default();
     let walker = fs

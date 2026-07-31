@@ -22,7 +22,11 @@ EROFS_IMG := $(BUILD)/rootfs.erofs
 MKFS_EROFS := $(EROFS_UTILS_BUILD)/mkfs/mkfs.erofs
 FUZZ_KERNEL_STAMP := $(BUILD)/fuzz-kernel.fingerprint
 SAMPLE ?= $(EROFS_IMG)
-EROFS_DRIVE = -drive file=$(abspath $(SAMPLE)),if=virtio,format=raw,readonly=on
+# QEMU option values treat commas as separators; a comma inside the sample
+# path must be doubled to survive -drive parsing. $(subst) needs the comma
+# spelling hidden behind a variable because commas separate its arguments.
+COMMA := ,
+EROFS_DRIVE = -drive file=$(subst $(COMMA),$(COMMA)$(COMMA),$(abspath $(SAMPLE))),if=virtio,format=raw,readonly=on
 
 KERNEL_CMDLINE := console=ttyS0 earlyprintk=serial panic=-1
 QEMU_ARGS := \

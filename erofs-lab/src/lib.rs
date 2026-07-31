@@ -603,6 +603,11 @@ fn apply_integrity(
     } else {
         block_size
     };
+    // The checksum field occupies bytes 4..8 of the coverage region; a
+    // logical block too small to contain it cannot carry a CRC at all.
+    if coverage_len < (CHECKSUM_OFFSET - SUPER_OFFSET + 4) as u64 {
+        return Err(Error::Bounds);
+    }
     let coverage_end = SUPER_OFFSET as u64 + coverage_len;
     if coverage_end > final_len {
         return Err(Error::TruncateConflict);
@@ -1205,6 +1210,24 @@ mod tests {
             ),
             expected
         );
+    }
+
+    #[test]
+    fn undersized_logical_block_cannot_hold_checksum() {
+        let mut parent = image();
+        parent[1032..1036].copy_from_slice(&SB_CHECKSUM_FEATURE.to_le_bytes());
+        // blkszbits = 2 yields a 4-byte logical block whose coverage region
+        // cannot contain the checksum field at bytes 4..8.
+        parent[1036] = 2;
+        assert!(matches!(
+            plan(
+                &parent,
+                &[],
+                MutationMode::Corrupt,
+                IntegrityPolicy::Recalculate,
+            ),
+            Err(Error::Bounds)
+        ));
     }
 
     #[test]

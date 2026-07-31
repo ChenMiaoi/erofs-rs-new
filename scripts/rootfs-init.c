@@ -50,6 +50,19 @@ struct traversal_stats {
 	int failed;
 };
 
+/*
+ * Paths built from dirent names contain guest-controlled bytes.  Never
+ * print them raw: a crafted name could embed a newline and spoof an
+ * EROFS_ORACLE marker line.  Print paths as hex instead.
+ */
+static void print_path_hex(const char *path)
+{
+	const unsigned char *p = (const unsigned char *)path;
+
+	while (*p)
+		printf("%02x", *p++);
+}
+
 #define ORACLE_MAX_NODES 100000UL
 #define ORACLE_MAX_DEPTH 256U
 #define ORACLE_MAX_BYTES (1ULL << 30)
@@ -68,8 +81,9 @@ static void traverse_all(const char *path, struct traversal_stats *stats, unsign
 
 	dir = opendir(path);
 	if (!dir) {
-		printf("EROFS_ORACLE phase=readdir status=rejected path=%s errno=%d\n",
-		       path, errno);
+		printf("EROFS_ORACLE phase=readdir status=rejected path=");
+		print_path_hex(path);
+		printf(" errno=%d\n", errno);
 		stats->failed = 1;
 		return;
 	}
@@ -88,8 +102,9 @@ static void traverse_all(const char *path, struct traversal_stats *stats, unsign
 		}
 
 		if (lstat(child, &st) < 0) {
-			printf("EROFS_ORACLE phase=inode status=rejected path=%s errno=%d\n",
-			       child, errno);
+			printf("EROFS_ORACLE phase=inode status=rejected path=");
+			print_path_hex(child);
+			printf(" errno=%d\n", errno);
 			stats->failed = 1;
 			continue;
 		}
@@ -108,8 +123,9 @@ static void traverse_all(const char *path, struct traversal_stats *stats, unsign
 			int fd = open(child, O_RDONLY);
 
 			if (fd < 0) {
-				printf("EROFS_ORACLE phase=read_data status=rejected path=%s errno=%d\n",
-				       child, errno);
+				printf("EROFS_ORACLE phase=read_data status=rejected path=");
+				print_path_hex(child);
+				printf(" errno=%d\n", errno);
 				stats->failed = 1;
 				continue;
 			}
@@ -123,8 +139,9 @@ static void traverse_all(const char *path, struct traversal_stats *stats, unsign
 				}
 			}
 			if (n < 0) {
-				printf("EROFS_ORACLE phase=read_data status=rejected path=%s errno=%d\n",
-				       child, errno);
+				printf("EROFS_ORACLE phase=read_data status=rejected path=");
+				print_path_hex(child);
+				printf(" errno=%d\n", errno);
 				stats->failed = 1;
 			}
 			close(fd);
@@ -133,8 +150,9 @@ static void traverse_all(const char *path, struct traversal_stats *stats, unsign
 
 			stats->symlinks++;
 			if (readlink(child, linkbuf, sizeof(linkbuf)) < 0) {
-				printf("EROFS_ORACLE phase=read_data status=rejected path=%s errno=%d\n",
-				       child, errno);
+				printf("EROFS_ORACLE phase=read_data status=rejected path=");
+				print_path_hex(child);
+				printf(" errno=%d\n", errno);
 				stats->failed = 1;
 			}
 		}
