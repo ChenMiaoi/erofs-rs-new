@@ -10,7 +10,9 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         return Err("usage: list_directory IMAGE DIRECTORY".into());
     }
 
-    let fs = EroFS::new(MmapImage::new_from_path(image)?)?;
+    // SAFETY: image file is not modified while mapped
+    let image = unsafe { MmapImage::new_from_path(image)? };
+    let fs = EroFS::new(image)?;
     for entry in fs.read_dir(path)? {
         let entry = entry?;
         println!(

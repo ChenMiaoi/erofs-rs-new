@@ -21,7 +21,8 @@ use crate::types::Inode;
 /// use erofs_rs::EroFS;
 /// use erofs_rs::backend::MmapImage;
 ///
-/// let image = MmapImage::new_from_path("image.erofs").unwrap();
+/// // SAFETY: image file is not modified while mapped
+/// let image = unsafe { MmapImage::new_from_path("image.erofs") }.unwrap();
 /// let fs = EroFS::new(image).unwrap();
 ///
 /// let mut file = fs.open("/etc/passwd").unwrap();
@@ -58,7 +59,11 @@ impl<'a, I: Image> Read for File<'a, I> {
             return Ok(0);
         }
 
-        if self.offset >= self.inode.data_size() {
+        let data_size = self
+            .inode
+            .data_size_checked()
+            .map_err(|e| std::io::Error::other(format!("invalid file size: {e}")))?;
+        if self.offset >= data_size {
             return Ok(0);
         }
 

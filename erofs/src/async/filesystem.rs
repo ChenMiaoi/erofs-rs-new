@@ -27,9 +27,12 @@ impl<I: AsyncImage> EroFS<I> {
     /// Creates a new async `EroFS` instance from an async backend image source.
     pub async fn new(image: I) -> Result<Self> {
         let mut super_block = vec![0u8; SuperBlock::size()];
-        image
+        let n = image
             .read_exact_at(&mut super_block, SUPER_BLOCK_OFFSET)
             .await?;
+        if n != super_block.len() {
+            return Err(Error::CorruptedData("short read from image".to_string()));
+        }
         let core = EroFSCore::new(&super_block)?;
         Ok(Self { image, core })
     }
@@ -86,7 +89,10 @@ impl<I: AsyncImage> EroFS<I> {
     pub async fn get_inode(&self, nid: u64) -> Result<Inode> {
         let offset = self.core.get_inode_offset(nid)?;
         let mut buf = vec![0u8; InodeExtended::size()];
-        self.image.read_exact_at(&mut buf, offset).await?;
+        let n = self.image.read_exact_at(&mut buf, offset).await?;
+        if n != buf.len() {
+            return Err(Error::CorruptedData("short read from image".to_string()));
+        }
         self.core.parse_inode(&buf, nid)
     }
 
@@ -101,7 +107,10 @@ impl<I: AsyncImage> EroFS<I> {
                 }
 
                 let mut buf = vec![0u8; size];
-                self.image.read_exact_at(&mut buf, offset).await?;
+                let n = self.image.read_exact_at(&mut buf, offset).await?;
+                if n != buf.len() {
+                    return Err(Error::CorruptedData("short read from image".to_string()));
+                }
                 Ok(buf)
             }
             BlockPlan::Chunked {
@@ -112,7 +121,10 @@ impl<I: AsyncImage> EroFS<I> {
                 chunk_index,
             } => {
                 let mut addr_buf = vec![0u8; 4];
-                self.image.read_exact_at(&mut addr_buf, addr_offset).await?;
+                let n = self.image.read_exact_at(&mut addr_buf, addr_offset).await?;
+                if n != addr_buf.len() {
+                    return Err(Error::CorruptedData("short read from image".to_string()));
+                }
                 let chunk_addr = (&addr_buf[..]).get_i32_le();
 
                 let (offset, size) = self.core.resolve_chunk_read(
@@ -123,7 +135,10 @@ impl<I: AsyncImage> EroFS<I> {
                     chunk_index,
                 )?;
                 let mut buf = vec![0u8; size];
-                self.image.read_exact_at(&mut buf, offset).await?;
+                let n = self.image.read_exact_at(&mut buf, offset).await?;
+                if n != buf.len() {
+                    return Err(Error::CorruptedData("short read from image".to_string()));
+                }
                 Ok(buf)
             }
         }
@@ -139,7 +154,12 @@ impl<I: AsyncImage> EroFS<I> {
             }
 
             let inode = self.get_inode(nid).await?;
-            let block_count = inode.data_size().div_ceil(self.core.block_size);
+            // Intermediate path components must resolve to directories
+            // (matches kernel behavior); the final component is exempt.
+            if !inode.is_dir() {
+                return Ok(None);
+            }
+            let block_count = inode.data_size_checked()?.div_ceil(self.core.block_size);
             if block_count == 0 {
                 return Ok(None);
             }

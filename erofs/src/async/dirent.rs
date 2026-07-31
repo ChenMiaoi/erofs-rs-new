@@ -32,16 +32,17 @@ impl<'a, I: AsyncImage> ReadDir<'a, I> {
     }
 
     pub async fn next_entry(&mut self) -> Result<Option<DirEntry>> {
-        if self.offset >= self.inode.data_size() {
+        let data_size = self.inode.data_size_checked()?;
+        if self.offset >= data_size {
             return Ok(None);
         }
 
-        while self.offset < self.inode.data_size() {
+        while self.offset < data_size {
             match self.dirent_block.next_entry()? {
                 Some(entry) => return Ok(Some(entry)),
                 None => {
                     self.offset += self.dirent_block.block_size();
-                    if self.offset < self.inode.data_size() {
+                    if self.offset < data_size {
                         let block_data = self
                             .erofs
                             .read_inode_block(&self.inode, self.offset)

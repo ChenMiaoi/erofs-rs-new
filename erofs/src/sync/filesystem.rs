@@ -24,7 +24,8 @@ use crate::{Error, Result};
 /// use std::io::Read;
 /// use erofs_rs::{EroFS, backend::MmapImage};
 ///
-/// let image = MmapImage::new_from_path("image.erofs").unwrap();
+/// // SAFETY: image file is not modified while mapped
+/// let image = unsafe { MmapImage::new_from_path("image.erofs") }.unwrap();
 /// let fs = EroFS::new(image).unwrap();
 ///
 /// let mut file = fs.open("/etc/passwd").unwrap();
@@ -70,7 +71,8 @@ impl<I: Image> EroFS<I> {
     /// use erofs_rs::{EroFS, backend::MmapImage};
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let image = MmapImage::new_from_path("image.erofs")?;
+    /// // SAFETY: image file is not modified while mapped
+    /// let image = unsafe { MmapImage::new_from_path("image.erofs")? };
     /// let fs = EroFS::new(image)?;
     /// # Ok(())
     /// # }
@@ -164,10 +166,14 @@ impl<I: Image> EroFS<I> {
 
     pub(crate) fn get_inode_block(&self, inode: &Inode, offset: usize) -> Result<&[u8]> {
         match self.core.plan_inode_block_read(inode, offset)? {
-            BlockPlan::Direct { offset, size } => self
-                .image
-                .get(offset..offset + size)
-                .ok_or_else(|| Error::OutOfBounds("failed to get inode data".to_string())),
+            BlockPlan::Direct { offset, size } => {
+                let end = offset
+                    .checked_add(size)
+                    .ok_or_else(|| Error::OutOfBounds("inode data range overflow".to_string()))?;
+                self.image
+                    .get(offset..end)
+                    .ok_or_else(|| Error::OutOfBounds("failed to get inode data".to_string()))
+            }
             BlockPlan::Chunked {
                 addr_offset,
                 chunk_fixed,
@@ -175,9 +181,12 @@ impl<I: Image> EroFS<I> {
                 data_size,
                 chunk_index,
             } => {
+                let addr_end = addr_offset.checked_add(4).ok_or_else(|| {
+                    Error::OutOfBounds("chunk address range overflow".to_string())
+                })?;
                 let chunk_addr = self
                     .image
-                    .get(addr_offset..addr_offset + 4)
+                    .get(addr_offset..addr_end)
                     .ok_or_else(|| Error::OutOfBounds("failed to get chunk address".to_string()))?
                     .get_i32_le();
 
@@ -188,8 +197,11 @@ impl<I: Image> EroFS<I> {
                     data_size,
                     chunk_index,
                 )?;
+                let end = offset
+                    .checked_add(size)
+                    .ok_or_else(|| Error::OutOfBounds("inode data range overflow".to_string()))?;
                 self.image
-                    .get(offset..offset + size)
+                    .get(offset..end)
                     .ok_or_else(|| Error::OutOfBounds("failed to get inode data".to_string()))
             }
         }
@@ -205,7 +217,12 @@ impl<I: Image> EroFS<I> {
             }
 
             let inode = self.get_inode(nid)?;
-            let block_count = inode.data_size().div_ceil(self.core.block_size);
+            // Intermediate path components must resolve to directories
+            // (matches kernel behavior); the final component is exempt.
+            if !inode.is_dir() {
+                return Ok(None);
+            }
+            let block_count = inode.data_size_checked()?.div_ceil(self.core.block_size);
             if block_count == 0 {
                 return Ok(None);
             }

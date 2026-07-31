@@ -17,7 +17,8 @@
 //! use erofs_rs::{EroFS, backend::MmapImage};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let image = MmapImage::new_from_path("image.erofs")?;
+//! // SAFETY: image file is not modified while mapped
+//! let image = unsafe { MmapImage::new_from_path("image.erofs")? };
 //! let fs = EroFS::new(image)?;
 //! # Ok(())
 //! # }
@@ -118,7 +119,9 @@ pub trait AsyncImage: Send + Sync {
     ///
     /// # Returns
     ///
-    /// The number of bytes read on success.
+    /// The number of bytes read on success. Implementations MUST fill the
+    /// entire buffer, returning `buf.len()`; a partial read MUST be reported
+    /// as an error instead of a short count.
     ///
     /// # Errors
     ///

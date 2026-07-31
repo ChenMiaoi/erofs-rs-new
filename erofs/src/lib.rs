@@ -16,7 +16,8 @@
 //! use std::io::Read;
 //! use erofs_rs::{EroFS, backend::MmapImage};
 //!
-//! let image = MmapImage::new_from_path("image.erofs").unwrap();
+//! // SAFETY: image file is not modified while mapped
+//! let image = unsafe { MmapImage::new_from_path("image.erofs") }.unwrap();
 //! let fs = EroFS::new(image).unwrap();
 //!
 //! // Read a file

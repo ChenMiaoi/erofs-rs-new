@@ -265,12 +265,10 @@ impl EroFSCore {
     }
 
     pub(crate) fn block_offset(&self, block: u32) -> Result<usize> {
-        usize::try_from(block)
-            .ok()
-            .and_then(|block| block.checked_shl(u32::from(self.super_block.blk_size_bits)))
-            .ok_or_else(|| {
-                Error::CorruptedData("block address exceeds platform limits".to_string())
-            })
+        // Widen before shifting so the computation cannot overflow on 32-bit.
+        let offset = u64::from(block) << self.super_block.blk_size_bits;
+        usize::try_from(offset)
+            .map_err(|_| Error::CorruptedData("block address exceeds platform limits".to_string()))
     }
 }
 

@@ -155,6 +155,10 @@ impl Inode {
         }
     }
 
+    /// Returns the file size in bytes.
+    ///
+    /// On 32-bit platforms, sizes above `usize::MAX` are truncated; use
+    /// [`Self::data_size_checked`] when the value feeds into arithmetic.
     #[inline]
     pub fn data_size(&self) -> usize {
         match self {
@@ -229,13 +233,9 @@ impl Inode {
         match self {
             Self::Compact((_, _)) => None,
             Self::Extended((_, n)) => {
-                let secs = n.mtime;
-                let nanos = n.mtime_ns;
-                Some(
-                    SystemTime::UNIX_EPOCH
-                        + Duration::from_secs(secs)
-                        + Duration::from_nanos(nanos as u64),
-                )
+                let duration = Duration::from_secs(n.mtime)
+                    .checked_add(Duration::from_nanos(n.mtime_ns as u64))?;
+                SystemTime::UNIX_EPOCH.checked_add(duration)
             }
         }
     }
@@ -445,5 +445,45 @@ impl MapHeader {
 
     pub fn fragmentoff(&self) -> u32 {
         u32::from_le((self._reserved as u32) << 16 | u32::from(self.data_size))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extended_inode(mtime: u64, mtime_ns: u32) -> Inode {
+        Inode::Extended((
+            1,
+            InodeExtended {
+                format: 0,
+                xattr_count: 0,
+                mode: 0,
+                reserved: 0,
+                size: 0,
+                inode_data: 0,
+                inode: 0,
+                uid: 0,
+                gid: 0,
+                mtime,
+                mtime_ns,
+                nlink: 0,
+                reserved2: [0; 16],
+            },
+        ))
+    }
+
+    #[test]
+    fn modified_returns_none_on_timestamp_overflow() {
+        assert_eq!(extended_inode(u64::MAX, 0).modified(), None);
+        assert_eq!(extended_inode(u64::MAX - 1, u32::MAX).modified(), None);
+    }
+
+    #[test]
+    fn modified_returns_time_for_valid_timestamp() {
+        let inode = extended_inode(1_000_000, 500);
+        let expected =
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000) + Duration::from_nanos(500);
+        assert_eq!(inode.modified(), Some(expected));
     }
 }

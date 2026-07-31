@@ -41,7 +41,7 @@ impl<'a, I: AsyncImage> File<'a, I> {
             return Ok(0);
         }
 
-        if self.offset >= self.inode.data_size() {
+        if self.offset >= self.inode.data_size_checked()? {
             return Ok(0);
         }
 
