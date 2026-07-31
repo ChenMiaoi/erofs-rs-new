@@ -2,10 +2,13 @@
 
 use std::{
     collections::BTreeSet,
-    fs,
+    fs::{self, OpenOptions},
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -18,7 +21,10 @@ use sha2::{Digest, Sha256};
 use crate::{
     Error, IntegrityPolicy, MutationIntent, MutationMode, ObjectRef, PublishedSample,
     apply_resolved_plan, materialize,
-    oracle::{OraclePaths, OracleProfile, OracleStatus, PublishedRun, ResourceLimits, run_oracle},
+    oracle::{
+        OraclePaths, OracleProfile, OracleStatus, PublishedRun, ResourceLimits,
+        run_oracle_with_control,
+    },
     plan,
 };
 
@@ -30,20 +36,21 @@ const PRNG: &str = "chacha12/v1";
 /// Furthest a persisted `case_offset` may skip into the PRNG combination
 /// stream; larger offsets are rejected instead of stalling generation.
 const MAX_CASE_SKIP: u64 = 1 << 20;
-static CANCELLED: AtomicBool = AtomicBool::new(false);
 
-/// Requests graceful campaign cancellation at the next safe interruption point.
-pub fn request_cancel() {
-    CANCELLED.store(true, Ordering::Relaxed);
-}
+/// Cancellation state owned by one campaign invocation.
+#[derive(Clone, Debug, Default)]
+pub struct CampaignControl(Arc<AtomicBool>);
 
-/// Clears a previously requested cancellation before starting a campaign.
-pub fn clear_cancel() {
-    CANCELLED.store(false, Ordering::Relaxed);
-}
-
-pub(crate) fn is_cancelled() -> bool {
-    CANCELLED.load(Ordering::Relaxed)
+impl CampaignControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 /// One symbolic field target available to a campaign.
@@ -476,19 +483,46 @@ pub fn run_campaign(
     oracle_paths: Option<&OraclePaths>,
     limits: ResourceLimits,
 ) -> Result<PublishedCampaign, Error> {
-    clear_cancel();
-    run_campaign_with_progress(parent_path, corpus, spec, oracle_paths, limits, |_| {})
+    run_campaign_with_progress_control(
+        parent_path,
+        corpus,
+        spec,
+        oracle_paths,
+        limits,
+        CampaignControl::new(),
+        |_| {},
+    )
 }
 
-/// Runs a campaign and reports completed-case statistics synchronously.
-/// Callers may persist or display progress without changing recipe, sample,
-/// report, or novelty semantics.
 pub fn run_campaign_with_progress<F>(
     parent_path: &Path,
     corpus: &Path,
     spec: CampaignSpec,
     oracle_paths: Option<&OraclePaths>,
     limits: ResourceLimits,
+    progress: F,
+) -> Result<PublishedCampaign, Error>
+where
+    F: FnMut(CampaignProgress<'_>),
+{
+    run_campaign_with_progress_control(
+        parent_path,
+        corpus,
+        spec,
+        oracle_paths,
+        limits,
+        CampaignControl::new(),
+        progress,
+    )
+}
+
+pub fn run_campaign_with_progress_control<F>(
+    parent_path: &Path,
+    corpus: &Path,
+    spec: CampaignSpec,
+    oracle_paths: Option<&OraclePaths>,
+    limits: ResourceLimits,
+    control: CampaignControl,
     mut progress: F,
 ) -> Result<PublishedCampaign, Error>
 where
@@ -517,7 +551,7 @@ where
     let total_cases = recipe.cases.len();
 
     for case in &recipe.cases {
-        if is_cancelled() {
+        if control.is_cancelled() {
             stopped_reason = "cancelled".into();
             break;
         }
@@ -650,7 +684,15 @@ where
         };
         materialized += 1;
         let mut identities = Vec::new();
-        if recipe.spec.funnel != FunnelPolicy::MaterializeOnly && !wall_over_budget() {
+        if oracle_runs >= recipe.spec.budget.max_oracle_runs {
+            stopped_reason = "oracle_budget".into();
+            break;
+        }
+        if recipe.spec.budget.wall_time_ms != 0 && wall_over_budget() {
+            stopped_reason = "wall_time".into();
+            break;
+        }
+        if recipe.spec.funnel != FunnelPolicy::MaterializeOnly {
             let paths =
                 oracle_paths.ok_or(Error::Unsupported("oracle paths required by funnel"))?;
             progress(CampaignProgress {
@@ -668,7 +710,13 @@ where
                 expectation_mismatch: false,
                 completed_case: None,
             });
-            let rust = run_profile(&sample, OracleProfile::RustFull, paths, limits.clone())?;
+            let rust = run_profile(
+                &sample,
+                OracleProfile::RustFull,
+                paths,
+                limits.clone(),
+                &control,
+            )?;
             oracle_runs += 1;
             let rust_novel = record_result(&mut novelty, &rust, &mut identities);
             let must_escalate = recipe.spec.funnel == FunnelPolicy::All
@@ -699,7 +747,13 @@ where
                     expectation_mismatch: false,
                     completed_case: None,
                 });
-                let fsck = run_profile(&sample, OracleProfile::FsckFull, paths, limits.clone())?;
+                let fsck = run_profile(
+                    &sample,
+                    OracleProfile::FsckFull,
+                    paths,
+                    limits.clone(),
+                    &control,
+                )?;
                 oracle_runs += 1;
                 let fsck_novel = record_result(&mut novelty, &fsck, &mut identities);
                 let disagreement = rust.result.status != fsck.result.status;
@@ -730,8 +784,13 @@ where
                         expectation_mismatch: false,
                         completed_case: None,
                     });
-                    let linux =
-                        run_profile(&sample, OracleProfile::LinuxKasan, paths, limits.clone())?;
+                    let linux = run_profile(
+                        &sample,
+                        OracleProfile::LinuxKasan,
+                        paths,
+                        limits.clone(),
+                        &control,
+                    )?;
                     oracle_runs += 1;
                     record_result(&mut novelty, &linux, &mut identities);
                 }
@@ -1226,10 +1285,9 @@ fn run_profile(
     profile: OracleProfile,
     paths: &OraclePaths,
     limits: ResourceLimits,
+    control: &CampaignControl,
 ) -> Result<PublishedRun, Error> {
-    // run_oracle applies the Linux KASAN resource floors itself and records
-    // both the requested and the effective limits in the run record.
-    run_oracle(&sample.manifest, profile, paths, limits)
+    run_oracle_with_control(&sample.manifest, profile, paths, limits, control)
 }
 
 fn record_result(
@@ -1316,7 +1374,13 @@ fn preserves_signature(
     let sample = materialize(parent_path, corpus, &resolved)?;
     for _ in 0..confirmations {
         *attempts += 1;
-        let run = run_profile(&sample, profile, paths, limits.clone())?;
+        let run = run_profile(
+            &sample,
+            profile,
+            paths,
+            limits.clone(),
+            &CampaignControl::new(),
+        )?;
         if run.result.signature != signature {
             return Ok(false);
         }
@@ -1390,7 +1454,6 @@ fn shrink_intent(intent: &RecipeIntent, parent_len: u64) -> Result<Vec<RecipeInt
     }
     Ok(output)
 }
-
 fn load_novelty(path: &Path) -> Result<NoveltyIndex, Error> {
     match fs::read(path) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
@@ -1402,9 +1465,22 @@ fn load_novelty(path: &Path) -> Result<NoveltyIndex, Error> {
     }
 }
 fn save_novelty(path: &Path, novelty: &NoveltyIndex) -> Result<(), Error> {
-    // Merge with whatever a concurrent campaign persisted while this one was
-    // running instead of blindly overwriting it. Identity sets only ever
-    // grow, so a union loses nothing; the in-memory schema wins on conflict.
+    let lock_path = path.with_extension("json.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
+    struct LockGuard<'a>(&'a std::fs::File);
+    impl Drop for LockGuard<'_> {
+        fn drop(&mut self) {
+            let _ = rustix::fs::flock(self.0, rustix::fs::FlockOperation::Unlock);
+        }
+    }
+    let _guard = LockGuard(&lock);
     let mut merged = load_novelty(path).unwrap_or_else(|_| NoveltyIndex {
         schema: NOVELTY_SCHEMA.into(),
         ..NoveltyIndex::default()

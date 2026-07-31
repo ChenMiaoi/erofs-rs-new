@@ -205,11 +205,37 @@ struct CapturedLog {
 }
 
 /// Executes one oracle profile and appends an immutable run record.
+pub fn run_oracle_with_control(
+    manifest_path: &Path,
+    profile: OracleProfile,
+    paths: &OraclePaths,
+    limits: ResourceLimits,
+    control: &crate::campaign::CampaignControl,
+) -> Result<PublishedRun, Error> {
+    run_oracle_inner(manifest_path, profile, paths, limits, control)
+}
+
 pub fn run_oracle(
     manifest_path: &Path,
     profile: OracleProfile,
     paths: &OraclePaths,
     limits: ResourceLimits,
+) -> Result<PublishedRun, Error> {
+    run_oracle_inner(
+        manifest_path,
+        profile,
+        paths,
+        limits,
+        &crate::campaign::CampaignControl::new(),
+    )
+}
+
+fn run_oracle_inner(
+    manifest_path: &Path,
+    profile: OracleProfile,
+    paths: &OraclePaths,
+    limits: ResourceLimits,
+    control: &crate::campaign::CampaignControl,
 ) -> Result<PublishedRun, Error> {
     let manifest: SampleManifest = serde_json::from_slice(&fs::read(manifest_path)?)?;
     let sample = manifest_path
@@ -261,7 +287,7 @@ pub fn run_oracle(
                 paths.reader_oracle.display().to_string(),
                 sample.display().to_string(),
             ];
-            let output = run_sandboxed(&argv, &stage, &effective_limits, false)?;
+            let output = run_sandboxed(&argv, &stage, &effective_limits, false, control)?;
             let result = classify_rust(&output);
             (
                 identity("rust-reader", None, &paths.reader_oracle, None, None, None)?,
@@ -280,7 +306,7 @@ pub fn run_oracle(
                 argv.push("--no-sbcrc".into());
             }
             argv.push(sample.display().to_string());
-            let output = run_sandboxed(&argv, &stage, &effective_limits, false)?;
+            let output = run_sandboxed(&argv, &stage, &effective_limits, false, control)?;
             let result = classify_fsck(&output);
             (
                 identity(
@@ -299,7 +325,7 @@ pub fn run_oracle(
         }
         OracleProfile::LinuxKasan => {
             let argv = qemu_argv(paths, &sample);
-            let output = run_sandboxed(&argv, &stage, &effective_limits, true)?;
+            let output = run_sandboxed(&argv, &stage, &effective_limits, true, control)?;
             let result = classify_qemu(&output);
             (
                 identity(
@@ -441,6 +467,7 @@ fn run_sandboxed(
     cwd: &Path,
     limits: &ResourceLimits,
     qemu: bool,
+    control: &crate::campaign::CampaignControl,
 ) -> Result<ProcessOutput, Error> {
     if argv.is_empty() || !Path::new(&argv[0]).is_file() {
         return Ok(harness_output("oracle binary is missing"));
@@ -487,7 +514,7 @@ fn run_sandboxed(
         if let Some(status) = child.try_wait()? {
             break (Some(status), false);
         }
-        if crate::campaign::is_cancelled() {
+        if control.is_cancelled() {
             let _ = child.kill();
             break (Some(child.wait()?), false);
         }
@@ -1046,19 +1073,19 @@ mod tests {
     #[test]
     fn sandbox_timeout_kills_child_when_user_namespaces_are_available() {
         let limits = ResourceLimits {
-            timeout_ms: 20,
+            timeout_ms: 100,
             cpu_seconds: 1,
             address_space_bytes: 64 << 20,
             file_bytes: 1 << 20,
             processes: 4,
             output_bytes: 1024,
         };
-        let directory = std::env::temp_dir();
         let output = run_sandboxed(
             &["/usr/bin/sleep".into(), "2".into()],
-            &directory,
+            &std::env::temp_dir(),
             &limits,
             false,
+            &crate::campaign::CampaignControl::new(),
         )
         .unwrap();
         if output.timed_out {
@@ -1078,6 +1105,7 @@ mod tests {
             &std::env::temp_dir(),
             &ResourceLimits::default(),
             false,
+            &crate::campaign::CampaignControl::new(),
         )
         .unwrap();
         assert!(output.status.is_none());
