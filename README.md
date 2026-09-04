@@ -81,7 +81,7 @@ erofs-rs = { version = "0.2.1", features = ["opendal"] }
 ## CLI
 
 Build the CLI with `cargo build -p erofs-cli`. The available top-level
-commands are `dump`, `inspect`, `convert`, `field`, `inject`, `mkfs`,
+commands are `dump`, `inspect`, `convert`, `field`, `view`, `inject`, `mkfs`,
 `replay`, `oracle`, and `campaign`. Each command provides detailed help with
 `--help`.
 
@@ -102,6 +102,11 @@ erofs-cli convert image.erofs --output out.tar
 erofs-cli field list --schema
 erofs-cli field locate image.erofs --object inode --space primary --nid 36 \
   --field erofs.inode.compact.i_format --json
+
+# Interactively explore image structure: block map, object tree, decoded
+# schema fields, and a hex view (plain-text output when not on a terminal).
+erofs-cli view image.erofs
+erofs-cli view image.erofs --no-tui
 ```
 
 HTTP images are supported by the CLI commands that use the OpenDAL backend:

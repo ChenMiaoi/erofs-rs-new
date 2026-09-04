@@ -438,7 +438,7 @@ fn predicate_name(value: Predicate) -> &'static str {
     }
 }
 
-fn display_value(value: DecodedValue) -> String {
+pub fn display_value(value: DecodedValue) -> String {
     match value {
         DecodedValue::Unsigned(value) => value.to_string(),
         DecodedValue::Bytes { bytes, len } => hex(&bytes[..usize::from(len)]),
@@ -455,7 +455,7 @@ fn value_json(value: DecodedValue) -> String {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut result = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {

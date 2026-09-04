@@ -11,6 +11,7 @@ mod inspect;
 mod mkfs;
 mod oracle;
 mod replay;
+mod view;
 
 #[derive(Subcommand, Debug)]
 enum Commands {
@@ -23,6 +24,7 @@ enum Commands {
     Convert(convert::ConvertArgs),
     Oracle(oracle::OracleArgs),
     Replay(replay::ReplayArgs),
+    View(view::ViewArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -54,6 +56,7 @@ async fn main() -> Result<()> {
         Commands::Convert(args) => convert::convert(args),
         Commands::Oracle(args) => oracle::oracle(args),
         Commands::Replay(args) => replay::replay_sample(args),
+        Commands::View(args) => view::view(args),
     }
 }
 
