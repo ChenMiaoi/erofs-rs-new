@@ -88,11 +88,21 @@ if [[ -n $cases && -f $offset_file ]]; then
     case_offset=$(<"$offset_file")
     [[ $case_offset =~ ^[0-9]+$ ]] || { printf 'invalid case offset state: %s\n' "$offset_file" >&2; exit 2; }
 fi
+# Persist the base seed so resuming with a saved next-case-offset continues
+# the same deterministic case stream instead of skipping into a fresh one.
+seed_file="$corpus/base-seed"
+if [[ -f $seed_file ]]; then
+    base_seed=$(<"$seed_file")
+    [[ $base_seed =~ ^[0-9]+$ ]] || { printf 'invalid base seed state: %s\n' "$seed_file" >&2; exit 2; }
+else
+    base_seed=$(date +%s)
+    printf '%s\n' "$base_seed" > "$seed_file"
+fi
 # Always rebuild the workspace binary: fuzz sessions must run the checked-out
 # dashboard rather than a possibly stale target/debug executable.
 cli=${EROFS_CLI:-$repo_root/target/debug/erofs-cli}
 if [[ -z ${EROFS_CLI:-} ]]; then
-    cargo build -q -p erofs-cli --manifest-path "$repo_root/Cargo.toml"
+    cargo build -q -p erofs-cli -p erofs-lab --manifest-path "$repo_root/Cargo.toml"
 elif [[ ! -x $cli ]]; then
     printf 'EROFS_CLI is not executable: %s\n' "$cli" >&2
     exit 2
@@ -126,7 +136,7 @@ fields=(
 start=$(date +%s)
 round=0
 while [[ -n $cases && $round -eq 0 ]] || { [[ -z $cases ]] && (( $(date +%s) - start < duration_seconds )); }; do
-    seed=$((start + round))
+    seed=$((base_seed + round))
     if [[ -n $cases ]]; then
         remaining=case-bounded
         samples_this_round=$cases

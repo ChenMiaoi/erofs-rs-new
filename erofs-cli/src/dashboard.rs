@@ -77,7 +77,7 @@ impl OracleTally {
             "accepted" => self.accepted += 1,
             "rejected" => self.rejected += 1,
             "crashed" => self.crashed += 1,
-            "timeout" => self.timeouts += 1,
+            "timed_out" | "timeout" => self.timeouts += 1,
             "resource_exhausted" => self.resource_exhausted += 1,
             "harness_error" => self.harness_errors += 1,
             _ => self.other += 1,
@@ -816,4 +816,44 @@ fn duration(value: Duration) -> String {
 }
 fn short_id(value: &str) -> &str {
     value.get(..16).unwrap_or(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OracleTally;
+
+    #[test]
+    fn tally_counts_library_status_names() {
+        let mut tally = OracleTally::default();
+        tally.add("accepted");
+        tally.add("rejected");
+        tally.add("crashed");
+        tally.add("timed_out");
+        tally.add("resource_exhausted");
+        tally.add("harness_error");
+        assert_eq!(tally.accepted, 1);
+        assert_eq!(tally.rejected, 1);
+        assert_eq!(tally.crashed, 1);
+        assert_eq!(tally.timeouts, 1);
+        assert_eq!(tally.resource_exhausted, 1);
+        assert_eq!(tally.harness_errors, 1);
+        assert_eq!(tally.other, 0);
+    }
+
+    #[test]
+    fn tally_accepts_legacy_timeout_alias() {
+        let mut tally = OracleTally::default();
+        tally.add("timeout");
+        assert_eq!(tally.timeouts, 1);
+        assert_eq!(tally.other, 0);
+    }
+
+    #[test]
+    fn tally_keeps_unknown_statuses_in_other() {
+        let mut tally = OracleTally::default();
+        tally.add("cancelled");
+        tally.add("unsupported");
+        assert_eq!(tally.other, 2);
+        assert_eq!(tally.timeouts, 0);
+    }
 }

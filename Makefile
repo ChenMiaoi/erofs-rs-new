@@ -127,8 +127,8 @@ fuzz-prereqs: deps-check erofs-utils
 	if [ -f "$(KERNEL_IMAGE)" ] && [ -f "$$stamp" ] && [ "$$(cat "$$stamp")" = "$$fingerprint" ]; then \
 		:; \
 	else \
-		if [ ! -f "$(KERNEL_IMAGE)" ]; then $(MAKE) --no-print-directory kernel; \
-		else $(MAKE) -C $(LINUX) O=$(LINUX_BUILD) ARCH=$(ARCH) -j$(JOBS) bzImage; fi; \
+		$(MAKE) --no-print-directory kernel-config; \
+		$(MAKE) -C $(LINUX) O=$(LINUX_BUILD) ARCH=$(ARCH) -j$(JOBS) bzImage; \
 		printf '%s\n' "$$fingerprint" > "$$stamp"; \
 	fi
 	@if [ ! -f "$(INITRAMFS)" ]; then $(MAKE) --no-print-directory initramfs; fi

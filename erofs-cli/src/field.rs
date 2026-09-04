@@ -264,8 +264,11 @@ fn print_occurrence_json(occurrence: &FieldOccurrence) {
 fn object_json(object: ObjectRef) -> String {
     match object {
         ObjectRef::Superblock => "{\"kind\":\"superblock\"}".into(),
-        ObjectRef::Inode { nid, .. } => {
-            format!("{{\"kind\":\"inode\",\"space\":\"primary\",\"nid\":\"{nid}\"}}")
+        ObjectRef::Inode { space, nid } => {
+            format!(
+                "{{\"kind\":\"inode\",\"space\":\"{}\",\"nid\":\"{nid}\"}}",
+                space_name(space)
+            )
         }
         ObjectRef::Dirent {
             directory,
@@ -316,7 +319,7 @@ fn object_json(object: ObjectRef) -> String {
 fn object_name(object: ObjectRef) -> String {
     match object {
         ObjectRef::Superblock => "superblock".into(),
-        ObjectRef::Inode { nid, .. } => format!("inode(primary,{nid})"),
+        ObjectRef::Inode { space, nid } => format!("inode({},{nid})", space_name(space)),
         ObjectRef::Dirent {
             directory,
             block,
@@ -400,6 +403,13 @@ fn structure_name(value: StructureId) -> &'static str {
         StructureId::CompressionIndex => "compression_index",
         StructureId::CompressionCompactPack => "compression_compact_pack",
         StructureId::CompressionExtent => "compression_extent",
+    }
+}
+
+fn space_name(value: MetadataSpace) -> &'static str {
+    match value {
+        MetadataSpace::Primary => "primary",
+        MetadataSpace::Metabox => "metabox",
     }
 }
 
