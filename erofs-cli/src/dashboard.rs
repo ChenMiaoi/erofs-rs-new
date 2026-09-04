@@ -25,7 +25,7 @@ use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Gauge, Paragraph, Row, Sparkline, Table, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Row, Sparkline, Table, Wrap},
 };
 
 const RECENT_CASE_LIMIT: usize = 200;
@@ -33,6 +33,22 @@ const THROUGHPUT_BUCKETS: usize = 120;
 const REDRAW_INTERVAL: Duration = Duration::from_millis(100);
 const COMPACT_WIDTH: u16 = 76;
 const COMPACT_HEIGHT: u16 = 18;
+
+// Shared visual language with `view`. Explicit backgrounds also prevent a
+// transparent terminal from bleeding through the dashboard.
+const BG: Color = Color::Rgb(13, 16, 22);
+const SURFACE: Color = Color::Rgb(18, 22, 29);
+const SURFACE_RAISED: Color = Color::Rgb(24, 30, 40);
+const TEXT: Color = Color::Rgb(226, 232, 240);
+const MUTED: Color = Color::Rgb(148, 163, 184);
+const BORDER: Color = Color::Rgb(71, 85, 105);
+const ACCENT: Color = Color::Rgb(251, 191, 36);
+const CYAN: Color = Color::Rgb(56, 189, 248);
+const GREEN: Color = Color::Rgb(52, 211, 153);
+const RED: Color = Color::Rgb(248, 113, 113);
+const ORANGE: Color = Color::Rgb(251, 146, 60);
+const PURPLE: Color = Color::Rgb(192, 132, 252);
+const BLUE: Color = Color::Rgb(96, 165, 250);
 
 /// Visual severity of a recent-case log line or outcome panel.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,10 +62,13 @@ enum Tone {
 impl Tone {
     fn style(self) -> Style {
         match self {
-            Self::Normal => Style::default(),
-            Self::Muted => Style::default().fg(Color::DarkGray),
-            Self::Warning => Style::default().fg(Color::Yellow),
-            Self::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Self::Normal => Style::default().fg(TEXT).bg(SURFACE),
+            Self::Muted => Style::default().fg(MUTED).bg(SURFACE),
+            Self::Warning => Style::default().fg(ORANGE).bg(SURFACE),
+            Self::Error => Style::default()
+                .fg(RED)
+                .bg(SURFACE)
+                .add_modifier(Modifier::BOLD),
         }
     }
 }
@@ -60,7 +79,7 @@ struct LogEntry {
 }
 
 /// Running counts of oracle verdicts, used by the distribution panel.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct OracleTally {
     accepted: u64,
     rejected: u64,
@@ -387,9 +406,9 @@ impl SharedState {
             duration(Duration::from_secs_f64(pending as f64 / rate))
         };
         let status_color = if self.planning_errors + self.interesting_results == 0 {
-            Color::Green
+            GREEN
         } else {
-            Color::Red
+            RED
         };
         let phase_color = phase_color(self.phase);
         let phase = self.phase.name();
@@ -400,37 +419,32 @@ impl SharedState {
             Span::styled(
                 " EROFS campaign ",
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .fg(BG)
+                    .bg(ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled(
                 format!(" {phase} "),
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(BG)
                     .bg(phase_color)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("  {elapsed} elapsed / {budget} budget"),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(MUTED).bg(SURFACE),
             ),
         ]);
         let rows = vec![
+            Row::new(vec![
+                "Case ID".to_owned(),
+                short_id(&self.case_id).to_owned(),
+            ]),
             Row::new(vec!["Generator".to_owned(), self.generator.clone()]),
             Row::new(vec![
-                "Mutations / case".to_owned(),
-                self.mutation_count.to_string(),
-            ]),
-            Row::new(vec!["Queue".to_owned(), format!("{pending} remaining")]),
-            Row::new(vec![
-                "Throughput".to_owned(),
-                format!("{rate:.2} cases/sec"),
-            ]),
-            Row::new(vec![
-                "Time".to_owned(),
-                format!("{elapsed} elapsed / {budget} budget; ETA {eta}"),
+                "Mutation plan".to_owned(),
+                format!("{} mutations", self.mutation_count),
             ]),
             Row::new(vec![
                 "Corpus".to_owned(),
@@ -448,9 +462,9 @@ impl SharedState {
                 },
             ])
             .style(Style::default().fg(if self.current_mismatch {
-                Color::Red
+                RED
             } else {
-                Color::Yellow
+                ACCENT
             })),
             Row::new(vec![
                 "Observed expectations".to_owned(),
@@ -460,14 +474,10 @@ impl SharedState {
                 ),
             ])
             .style(Style::default().fg(if self.expectation_mismatches == 0 {
-                Color::Green
+                GREEN
             } else {
-                Color::Red
+                RED
             })),
-            Row::new(vec![
-                "Oracle funnel".to_owned(),
-                format!("{} executions", self.oracle_runs),
-            ]),
             Row::new(vec![
                 "Findings".to_owned(),
                 format!(
@@ -482,37 +492,78 @@ impl SharedState {
             ])
             .style(
                 Style::default().fg(if self.current_finding == "no finding" {
-                    Color::Green
+                    GREEN
                 } else {
-                    Color::Yellow
+                    ORANGE
                 }),
             ),
         ];
         let mut tally_ok = vec![
-            count_span("accepted", self.oracle.accepted, Color::Green),
+            count_span("accepted", self.oracle.accepted, GREEN),
             Span::raw("   "),
-            count_span("rejected", self.oracle.rejected, Color::Cyan),
+            count_span("rejected", self.oracle.rejected, CYAN),
         ];
         if self.oracle.other > 0 {
             tally_ok.push(Span::raw("   "));
-            tally_ok.push(count_span("other", self.oracle.other, Color::DarkGray));
+            tally_ok.push(count_span("other", self.oracle.other, MUTED));
         }
         let tally_alert = Line::from(vec![
-            count_span("crashed", self.oracle.crashed, Color::Red),
+            count_span("crashed", self.oracle.crashed, RED),
             Span::raw("   "),
-            count_span("timeout", self.oracle.timeouts, Color::Yellow),
+            count_span("timeout", self.oracle.timeouts, ORANGE),
             Span::raw("   "),
-            count_span("resource", self.oracle.resource_exhausted, Color::Yellow),
+            count_span("resource", self.oracle.resource_exhausted, ACCENT),
             Span::raw("   "),
-            count_span("harness", self.oracle.harness_errors, Color::Red),
+            count_span("harness", self.oracle.harness_errors, RED),
         ]);
         let tally_lines = vec![Line::from(tally_ok), tally_alert];
+        let kpis = Line::from(vec![
+            Span::styled(
+                " RATE ",
+                Style::default()
+                    .fg(BG)
+                    .bg(CYAN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {rate:.2} cases/s  "), Style::default().fg(TEXT)),
+            Span::styled(
+                " ETA ",
+                Style::default()
+                    .fg(BG)
+                    .bg(BLUE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {eta}  "), Style::default().fg(TEXT)),
+            Span::styled(
+                " CORPUS ",
+                Style::default()
+                    .fg(BG)
+                    .bg(PURPLE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {}  ", self.samples_materialized),
+                Style::default().fg(TEXT),
+            ),
+            Span::styled(
+                " FINDINGS ",
+                Style::default()
+                    .fg(BG)
+                    .bg(status_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {} ", self.planning_errors + self.interesting_results),
+                Style::default().fg(TEXT),
+            ),
+        ]);
         let log_lines: Vec<Line> = self
             .recent
             .iter()
             .map(|entry| Line::from(Span::styled(entry.text.clone(), entry.tone.style())))
             .collect();
         let throughput: Vec<u64> = self.throughput.iter().copied().collect();
+        let oracle = self.oracle;
         let compact_info = vec![
             Line::from(vec![
                 Span::styled(
@@ -521,15 +572,19 @@ impl SharedState {
                         .fg(phase_color)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!(" · {}", self.generator)),
+                Span::styled(format!(" · {}", self.generator), Style::default().fg(TEXT)),
             ]),
-            Line::from(format!(
-                "queue {pending} · {rate:.2} cases/s · ETA {eta} · {elapsed} / {budget}"
-            )),
-            Line::from(format!(
-                "corpus {} samples · {} dup bytes · {} oracle runs",
-                self.samples_materialized, self.duplicate_bytes, self.oracle_runs
-            )),
+            Line::styled(
+                format!("queue {pending} · {rate:.2} cases/s · ETA {eta} · {elapsed} / {budget}"),
+                Style::default().fg(TEXT),
+            ),
+            Line::styled(
+                format!(
+                    "corpus {} samples · {} dup bytes · {} oracle runs",
+                    self.samples_materialized, self.duplicate_bytes, self.oracle_runs
+                ),
+                Style::default().fg(MUTED),
+            ),
             Line::from(vec![
                 Span::styled(
                     format!(
@@ -537,9 +592,9 @@ impl SharedState {
                         self.expected_accepted, self.expected_rejected, self.expectation_mismatches
                     ),
                     Style::default().fg(if self.expectation_mismatches == 0 {
-                        Color::Green
+                        GREEN
                     } else {
-                        Color::Red
+                        RED
                     }),
                 ),
                 Span::raw("  "),
@@ -568,35 +623,39 @@ impl SharedState {
         let footer = if completion_mode {
             (
                 "Campaign complete — press Enter, Esc, or q to return to the terminal.",
-                Style::default().fg(Color::Green),
+                Style::default().fg(GREEN).bg(SURFACE),
             )
         } else if show_help {
             (
                 "Ctrl-C stop · ↑/↓ or j/k scroll log · PgUp/PgDn page · End jump to latest · h/? close help",
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(CYAN).bg(SURFACE),
             )
         } else {
             (
                 "h/? keys · Ctrl-C stops · recipe, report, corpus, and novelty index are written atomically on completion",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(MUTED).bg(SURFACE),
             )
         };
         self.terminal.draw(|frame| {
             let area = frame.area();
+            frame.render_widget(Clear, area);
+            frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
             let compact = area.width < COMPACT_WIDTH || area.height < COMPACT_HEIGHT;
             let gauge = Gauge::default()
                 .block(panel(active.clone()))
                 .gauge_style(
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(CYAN)
+                        .bg(SURFACE_RAISED)
                         .add_modifier(Modifier::BOLD),
                 )
+                .style(Style::default().fg(TEXT).bg(SURFACE))
                 .label(gauge_label.clone())
                 .percent(percent);
             let detail_title = if completion_mode {
-                ("Campaign summary", Color::Green)
+                ("Campaign summary", GREEN)
             } else {
-                ("Last completed case", Color::Cyan)
+                ("Last completed case", CYAN)
             };
             let detail = Paragraph::new(outcome.clone())
                 .style(outcome_tone.style())
@@ -615,18 +674,23 @@ impl SharedState {
                 ])
                 .split(area);
                 frame.render_widget(
-                    Paragraph::new(header.clone()).block(panel("Dashboard")),
+                    Paragraph::new(header.clone())
+                        .style(Style::default().bg(SURFACE))
+                        .block(panel("Dashboard")),
                     chunks[0],
                 );
                 frame.render_widget(gauge, chunks[1]);
                 frame.render_widget(
-                    Paragraph::new(compact_info.clone()).block(panel("Campaign activity")),
+                    Paragraph::new(compact_info.clone())
+                        .style(Style::default().fg(TEXT).bg(SURFACE))
+                        .block(panel("Campaign activity")),
                     chunks[2],
                 );
                 frame.render_widget(detail, chunks[3]);
                 frame.render_widget(footer_widget, chunks[4]);
             } else {
                 let chunks = Layout::vertical([
+                    Constraint::Length(3),
                     Constraint::Length(3),
                     Constraint::Length(3),
                     Constraint::Min(12),
@@ -636,25 +700,38 @@ impl SharedState {
                 .margin(1)
                 .split(area);
                 let middle =
-                    Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
-                        .split(chunks[2]);
+                    Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)])
+                        .split(chunks[3]);
                 let right = Layout::vertical([
-                    Constraint::Length(3),
-                    Constraint::Length(4),
+                    Constraint::Length(5),
+                    Constraint::Length(5),
                     Constraint::Min(5),
                 ])
                 .split(middle[1]);
-                frame.render_widget(Paragraph::new(header.clone()).block(panel("")), chunks[0]);
+                frame.render_widget(
+                    Paragraph::new(header.clone())
+                        .style(Style::default().bg(SURFACE))
+                        .block(panel("Live campaign")),
+                    chunks[0],
+                );
                 frame.render_widget(gauge, chunks[1]);
+                frame.render_widget(
+                    Paragraph::new(kpis.clone())
+                        .style(Style::default().fg(TEXT).bg(SURFACE))
+                        .block(panel("At a glance")),
+                    chunks[2],
+                );
                 frame.render_widget(
                     Table::new(rows, [Constraint::Length(20), Constraint::Min(24)])
                         .header(
                             Row::new(["What is happening", "Current state"]).style(
                                 Style::default()
-                                    .fg(Color::Cyan)
+                                    .fg(ACCENT)
+                                    .bg(SURFACE_RAISED)
                                     .add_modifier(Modifier::BOLD),
                             ),
                         )
+                        .style(Style::default().fg(TEXT).bg(SURFACE))
                         .column_spacing(2)
                         .block(panel("Campaign activity")),
                     middle[0],
@@ -663,23 +740,32 @@ impl SharedState {
                     Sparkline::default()
                         .block(panel("Throughput · cases/sec"))
                         .data(&throughput)
-                        .style(Style::default().fg(Color::Cyan)),
+                        .style(Style::default().fg(CYAN).bg(SURFACE)),
                     right[0],
                 );
+                let verdict_width = right[1].width.saturating_sub(2) as usize;
+                let mut verdicts = vec![verdict_bar(verdict_width, &oracle)];
+                verdicts.extend(tally_lines.clone());
                 frame.render_widget(
-                    Paragraph::new(tally_lines.clone()).block(panel("Oracle verdicts")),
+                    Paragraph::new(verdicts)
+                        .style(Style::default().fg(TEXT).bg(SURFACE))
+                        .block(panel(format!(
+                            "Oracle verdicts · {} runs",
+                            self.oracle_runs
+                        ))),
                     right[1],
                 );
                 let view_height = right[2].height.saturating_sub(2) as usize;
                 let skip = log_lines.len().saturating_sub(view_height + scroll_offset);
                 frame.render_widget(
                     Paragraph::new(log_lines.clone())
+                        .style(Style::default().fg(TEXT).bg(SURFACE))
                         .block(panel("Recent cases · ↑/↓ scroll"))
                         .scroll((skip as u16, 0)),
                     right[2],
                 );
-                frame.render_widget(detail, chunks[3]);
-                frame.render_widget(footer_widget, chunks[4]);
+                frame.render_widget(detail, chunks[4]);
+                frame.render_widget(footer_widget, chunks[5]);
             }
         })?;
         self.last_draw = Instant::now();
@@ -706,37 +792,99 @@ impl Drop for CampaignDashboard {
 
 fn panel(title: impl Into<Line<'static>>) -> Block<'static> {
     Block::default()
-        .title(title)
+        .title(
+            title.into().style(
+                Style::default()
+                    .fg(MUTED)
+                    .bg(SURFACE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .style(Style::default().fg(TEXT).bg(SURFACE))
 }
 
 fn panel_styled(title: &'static str, color: Color) -> Block<'static> {
     Block::default()
         .title(Span::styled(
-            title,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
+            format!(" {title} "),
+            Style::default()
+                .fg(color)
+                .bg(SURFACE)
+                .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(color))
+        .style(Style::default().fg(TEXT).bg(SURFACE))
 }
 
 fn count_span(label: &'static str, count: u64, alert: Color) -> Span<'static> {
     let style = if count == 0 {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(MUTED).bg(SURFACE)
     } else {
-        Style::default().fg(alert).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(alert)
+            .bg(SURFACE)
+            .add_modifier(Modifier::BOLD)
     };
     Span::styled(format!("{label} {count}"), style)
 }
 
+fn verdict_bar(width: usize, tally: &OracleTally) -> Line<'static> {
+    let segments = [
+        (tally.accepted, GREEN),
+        (tally.rejected, CYAN),
+        (tally.crashed, RED),
+        (tally.timeouts, ORANGE),
+        (tally.resource_exhausted, ACCENT),
+        (tally.harness_errors, PURPLE),
+        (tally.other, MUTED),
+    ];
+    let total: u64 = segments.iter().map(|(count, _)| count).sum();
+    let width = width.max(1);
+    if total == 0 {
+        return Line::from(Span::styled(
+            "·".repeat(width),
+            Style::default().fg(BORDER).bg(SURFACE),
+        ));
+    }
+
+    let mut used = 0;
+    let mut spans = Vec::new();
+    let nonzero = segments.iter().filter(|(count, _)| *count > 0).count();
+    let mut emitted = 0;
+    for (count, color) in segments {
+        if count == 0 {
+            continue;
+        }
+        emitted += 1;
+        let segment_width = if emitted == nonzero {
+            width.saturating_sub(used)
+        } else {
+            ((count as usize).saturating_mul(width) / total as usize).max(1)
+        }
+        .min(width.saturating_sub(used));
+        if segment_width > 0 {
+            spans.push(Span::styled(
+                "█".repeat(segment_width),
+                Style::default().fg(color).bg(SURFACE),
+            ));
+            used += segment_width;
+        }
+    }
+    Line::from(spans)
+}
+
 fn phase_color(phase: CampaignPhase) -> Color {
     match phase {
-        CampaignPhase::Planning => Color::Yellow,
-        CampaignPhase::Materializing => Color::Cyan,
-        CampaignPhase::RustOracle | CampaignPhase::FsckOracle => Color::Magenta,
-        CampaignPhase::LinuxOracle => Color::Blue,
-        CampaignPhase::Complete => Color::Green,
+        CampaignPhase::Planning => ACCENT,
+        CampaignPhase::Materializing => CYAN,
+        CampaignPhase::RustOracle | CampaignPhase::FsckOracle => PURPLE,
+        CampaignPhase::LinuxOracle => BLUE,
+        CampaignPhase::Complete => GREEN,
     }
 }
 
@@ -820,7 +968,7 @@ fn short_id(value: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::OracleTally;
+    use super::{OracleTally, verdict_bar};
 
     #[test]
     fn tally_counts_library_status_names() {
@@ -855,5 +1003,19 @@ mod tests {
         tally.add("unsupported");
         assert_eq!(tally.other, 2);
         assert_eq!(tally.timeouts, 0);
+    }
+
+    #[test]
+    fn verdict_bar_fills_available_width() {
+        let tally = OracleTally {
+            accepted: 8,
+            rejected: 4,
+            crashed: 1,
+            timeouts: 1,
+            ..OracleTally::default()
+        };
+        assert_eq!(verdict_bar(37, &tally).width(), 37);
+        assert_eq!(verdict_bar(5, &tally).width(), 5);
+        assert_eq!(verdict_bar(24, &OracleTally::default()).width(), 24);
     }
 }
