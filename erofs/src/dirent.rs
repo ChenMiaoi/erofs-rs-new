@@ -12,13 +12,15 @@ use crate::{
 pub fn find_nodeid_by_name(name: &[u8], data: &[u8]) -> Result<Option<u64>> {
     let dirent = read_nth_dirent(data, 0)?;
     let n = dirent.name_off as usize / Dirent::size();
-    if n <= 2 {
-        // Only "." and ".."
+    if n == 0 {
         return Ok(None);
     }
 
-    let offset = 2;
-    let mut size = n - offset;
+    // Dots appear only in the first dirent block of a directory, so the
+    // search range covers every entry; `.` and `..` can never equal a lookup
+    // name since path components are normalized before lookup.
+    let offset = 0;
+    let mut size = n;
     let mut base = 0usize;
     while size > 1 {
         let half = size / 2;
@@ -290,5 +292,26 @@ mod tests {
             find_nodeid_by_name(b"a/b", &data),
             Err(Error::CorruptedData(message)) if message == "directory entry name contains '/'"
         ));
+    }
+
+    #[test]
+    fn find_nodeid_by_name_searches_dotless_blocks_from_index_zero() {
+        // Non-first dirent blocks of a directory contain no "." or ".."
+        // entries; their first two entries must stay reachable.
+        let data = dir_block(&[(10, 1, "apple"), (11, 1, "banana"), (12, 1, "cherry")]);
+        assert_eq!(find_nodeid_by_name(b"apple", &data).unwrap(), Some(10));
+        assert_eq!(find_nodeid_by_name(b"banana", &data).unwrap(), Some(11));
+        assert_eq!(find_nodeid_by_name(b"cherry", &data).unwrap(), Some(12));
+        assert_eq!(find_nodeid_by_name(b"apricot", &data).unwrap(), None);
+        assert_eq!(find_nodeid_by_name(b"zebra", &data).unwrap(), None);
+    }
+
+    #[test]
+    fn find_nodeid_by_name_includes_dots_in_first_block_search_range() {
+        // Real lookup names never equal the dot entries, but searching the
+        // full range must not corrupt results when dots lead the block.
+        let data = dir_block(&[(1, 2, "."), (2, 2, ".."), (3, 1, "ok")]);
+        assert_eq!(find_nodeid_by_name(b"ok", &data).unwrap(), Some(3));
+        assert_eq!(find_nodeid_by_name(b"zz", &data).unwrap(), None);
     }
 }

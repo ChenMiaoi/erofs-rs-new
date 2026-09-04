@@ -81,18 +81,19 @@ impl<'a, I: Image> WalkDir<'a, I> {
         } else {
             self.max_depth
         };
-        if dir_entry.file_type().is_dir() {
-            if depth >= max_depth {
-                return Err(Error::CorruptedData(
-                    "directory traversal depth limit".into(),
-                ));
-            }
+        if dir_entry.file_type().is_dir() && depth < max_depth {
             if self.ancestor_nids.contains(&inode.id()) {
                 return Err(Error::CorruptedData("directory traversal cycle".into()));
             }
             let child_dir = ReadDir::new(self.erofs, inode, dir_entry.path())?;
             self.dir_stack.push((depth + 1, inode.id(), child_dir));
             self.ancestor_nids.insert(inode.id());
+        } else if dir_entry.file_type().is_dir() && self.max_depth == 0 {
+            // Only the implicit hard cap errors; an explicit max_depth
+            // yields the directory entry without descending into it.
+            return Err(Error::CorruptedData(
+                "directory traversal depth limit".into(),
+            ));
         }
 
         Ok(WalkDirEntry {
