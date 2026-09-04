@@ -64,6 +64,8 @@ pub enum OracleStatus {
     ResourceExhausted,
     Unsupported,
     HarnessError,
+    /// Killed because the campaign was cancelled; never a verdict.
+    Cancelled,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -194,6 +196,8 @@ struct ProcessOutput {
     stderr: Vec<u8>,
     wall: Duration,
     timed_out: bool,
+    /// Killed in response to campaign cancellation, not on its own.
+    cancelled: bool,
     truncated_stdout: bool,
     truncated_stderr: bool,
 }
@@ -510,17 +514,17 @@ fn run_sandboxed(
     let stdout_thread = thread::spawn(move || capture_log(stdout, output_limit));
     let stderr_thread = thread::spawn(move || capture_log(stderr, output_limit));
     let deadline = start + Duration::from_millis(limits.timeout_ms);
-    let (status, timed_out) = loop {
+    let (status, timed_out, cancelled) = loop {
         if let Some(status) = child.try_wait()? {
-            break (Some(status), false);
+            break (Some(status), false, false);
         }
         if control.is_cancelled() {
             let _ = child.kill();
-            break (Some(child.wait()?), false);
+            break (Some(child.wait()?), false, true);
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            break (Some(child.wait()?), true);
+            break (Some(child.wait()?), true, false);
         }
         thread::sleep(Duration::from_millis(if qemu { 20 } else { 5 }));
     };
@@ -532,6 +536,7 @@ fn run_sandboxed(
         stderr: stderr.bytes,
         wall: start.elapsed(),
         timed_out,
+        cancelled,
         truncated_stdout: stdout.truncated,
         truncated_stderr: stderr.truncated,
     })
@@ -568,7 +573,40 @@ fn qemu_argv(paths: &OraclePaths, sample: &Path) -> Vec<String> {
     ]
 }
 
+// Signal numbers from signal(7). RLIMIT_CPU enforcement kills with SIGXCPU
+// and RLIMIT_FSIZE with SIGXFSZ; allocation failure aborts with SIGABRT.
+// These deaths are resource exhaustion, not image-dependent crashes.
+const SIGABRT: i32 = 6;
+const SIGXCPU: i32 = 24;
+const SIGXFSZ: i32 = 25;
+
+/// Returns the lower-case signal name when a signal death was caused by
+/// rlimit enforcement or allocation failure rather than by an oracle bug.
+fn rlimit_signal(signal: i32, stderr: &[u8]) -> Option<&'static str> {
+    match signal {
+        SIGXCPU => Some("sigxcpu"),
+        SIGXFSZ => Some("sigxfsz"),
+        SIGABRT if allocation_failure(stderr) => Some("sigabrt"),
+        _ => None,
+    }
+}
+
+fn allocation_failure(stderr: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    text.contains("memory allocation")
+        || text.contains("cannot allocate memory")
+        || text.contains("out of memory")
+}
+
 fn classify_rust(output: &ProcessOutput) -> OracleResult {
+    if output.cancelled {
+        return result(
+            OracleStatus::Cancelled,
+            OraclePhase::Unknown,
+            "rust:cancelled",
+            Some("cancelled"),
+        );
+    }
     if output.timed_out {
         return result(
             OracleStatus::TimedOut,
@@ -577,7 +615,33 @@ fn classify_rust(output: &ProcessOutput) -> OracleResult {
             Some("timeout"),
         );
     }
-    if output.status.and_then(|status| status.signal()).is_some() {
+    let text = String::from_utf8_lossy(&output.stdout);
+    // The reader's panic hook emits a crash event for unwind (debug) and
+    // abort (release) builds alike, so a panic classifies as Crashed with a
+    // stable `rust:panic:<file:line>` signature regardless of exit code or
+    // signal. This must precede signal classification: abort panics die
+    // with SIGABRT.
+    if let Some(line) = text.lines().rev().find(|line| {
+        line.contains("\"phase\":\"panic\"") && line.contains("\"status\":\"crashed\"")
+    }) {
+        let class = class_from_json(line);
+        let location = class.strip_prefix("panic at ").unwrap_or(&class);
+        return result(
+            OracleStatus::Crashed,
+            OraclePhase::Unknown,
+            &format!("rust:panic:{location}"),
+            Some("panic-event"),
+        );
+    }
+    if let Some(signal) = output.status.and_then(|status| status.signal()) {
+        if let Some(name) = rlimit_signal(signal, &output.stderr) {
+            return result(
+                OracleStatus::ResourceExhausted,
+                OraclePhase::Unknown,
+                &format!("rust:rlimit:{name}"),
+                Some("rlimit-signal"),
+            );
+        }
         return result(
             OracleStatus::Crashed,
             OraclePhase::Unknown,
@@ -585,7 +649,6 @@ fn classify_rust(output: &ProcessOutput) -> OracleResult {
             Some("signal"),
         );
     }
-    let text = String::from_utf8_lossy(&output.stdout);
     if text.lines().any(|line| {
         line.contains("\"phase\":\"complete\"") && line.contains("\"status\":\"accepted\"")
     }) {
@@ -599,12 +662,25 @@ fn classify_rust(output: &ProcessOutput) -> OracleResult {
     if let Some(line) = text
         .lines()
         .rev()
+        .find(|line| line.contains("\"status\":\"resource_exhausted\""))
+    {
+        return result(
+            OracleStatus::ResourceExhausted,
+            phase_from_text(line),
+            &format!("rust:{}", class_from_json(line)),
+            Some("resource-event"),
+        );
+    }
+    if let Some(line) = text
+        .lines()
+        .rev()
         .find(|line| line.contains("\"status\":\"rejected\""))
     {
+        let phase = field_from_json(line, "phase").unwrap_or_else(|| "unknown".into());
         return result(
             OracleStatus::Rejected,
             phase_from_text(line),
-            &format!("rust:{}", class_from_json(line)),
+            &format!("rust:{phase}:{}", class_from_json(line)),
             Some("rejected-event"),
         );
     }
@@ -625,6 +701,14 @@ fn classify_rust(output: &ProcessOutput) -> OracleResult {
 }
 
 fn classify_fsck(output: &ProcessOutput) -> OracleResult {
+    if output.cancelled {
+        return result(
+            OracleStatus::Cancelled,
+            OraclePhase::Unknown,
+            "fsck:cancelled",
+            Some("cancelled"),
+        );
+    }
     if output.timed_out {
         return result(
             OracleStatus::TimedOut,
@@ -633,7 +717,18 @@ fn classify_fsck(output: &ProcessOutput) -> OracleResult {
             Some("timeout"),
         );
     }
-    if output.status.and_then(|status| status.signal()).is_some() {
+    // Signal classification comes first: rlimit-enforcement deaths are
+    // resource exhaustion, and the text checks below only apply to
+    // non-signal exits.
+    if let Some(signal) = output.status.and_then(|status| status.signal()) {
+        if let Some(name) = rlimit_signal(signal, &output.stderr) {
+            return result(
+                OracleStatus::ResourceExhausted,
+                OraclePhase::Unknown,
+                &format!("fsck:rlimit:{name}"),
+                Some("rlimit-signal"),
+            );
+        }
         return result(
             OracleStatus::Crashed,
             OraclePhase::Unknown,
@@ -700,6 +795,15 @@ fn classify_fsck(output: &ProcessOutput) -> OracleResult {
 }
 
 fn classify_qemu(output: &ProcessOutput) -> OracleResult {
+    // A cancelled run's captured text is incomplete; it is never a verdict.
+    if output.cancelled {
+        return result(
+            OracleStatus::Cancelled,
+            OraclePhase::Unknown,
+            "linux:cancelled",
+            Some("cancelled"),
+        );
+    }
     let text = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
@@ -770,7 +874,15 @@ fn classify_qemu(output: &ProcessOutput) -> OracleResult {
             Some("complete-marker"),
         );
     }
-    if output.status.and_then(|status| status.signal()).is_some() {
+    if let Some(signal) = output.status.and_then(|status| status.signal()) {
+        if let Some(name) = rlimit_signal(signal, &output.stderr) {
+            return result(
+                OracleStatus::ResourceExhausted,
+                OraclePhase::Unknown,
+                &format!("linux:rlimit:{name}"),
+                Some("rlimit-signal"),
+            );
+        }
         return result(
             OracleStatus::Crashed,
             OraclePhase::Unknown,
@@ -836,16 +948,14 @@ fn fsck_phase(text: &str) -> OraclePhase {
     }
 }
 
-fn class_from_json(line: &str) -> String {
+fn field_from_json(line: &str, field: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(line)
         .ok()
-        .and_then(|value| {
-            value
-                .get("error_class")
-                .and_then(|value| value.as_str())
-                .map(Into::into)
-        })
-        .unwrap_or_else(|| "rejected".into())
+        .and_then(|value| value.get(field)?.as_str().map(Into::into))
+}
+
+fn class_from_json(line: &str) -> String {
+    field_from_json(line, "error_class").unwrap_or_else(|| "rejected".into())
 }
 
 fn identity(
@@ -909,6 +1019,7 @@ fn harness_output(message: &str) -> ProcessOutput {
         stderr: message.as_bytes().to_vec(),
         wall: Duration::ZERO,
         timed_out: false,
+        cancelled: false,
         truncated_stdout: false,
         truncated_stderr: false,
     }
@@ -925,8 +1036,23 @@ mod tests {
             stderr: stderr.as_bytes().to_vec(),
             wall: Duration::from_millis(1),
             timed_out,
+            cancelled: false,
             truncated_stdout: false,
             truncated_stderr: false,
+        }
+    }
+
+    fn signal_output(signal: i32, stdout: &str, stderr: &str) -> ProcessOutput {
+        ProcessOutput {
+            status: Some(std::process::ExitStatus::from_raw(signal)),
+            ..output(stdout, stderr, 0, false)
+        }
+    }
+
+    fn cancelled_output(signal: i32) -> ProcessOutput {
+        ProcessOutput {
+            cancelled: true,
+            ..signal_output(signal, "", "")
         }
     }
 
@@ -1110,5 +1236,108 @@ mod tests {
         .unwrap();
         assert!(output.status.is_none());
         assert!(String::from_utf8_lossy(&output.stderr).contains("missing"));
+    }
+
+    #[test]
+    fn cancelled_kill_is_never_a_crash() {
+        for classify in [classify_rust, classify_fsck, classify_qemu] {
+            let result = classify(&cancelled_output(9));
+            assert_eq!(result.status, OracleStatus::Cancelled);
+            assert!(result.signature.ends_with(":cancelled"));
+        }
+    }
+
+    #[test]
+    fn rlimit_signals_are_resource_exhaustion_not_crashes() {
+        type Classifier = fn(&ProcessOutput) -> OracleResult;
+        let cases: [(Classifier, &str); 3] = [
+            (classify_rust, "rust"),
+            (classify_fsck, "fsck"),
+            (classify_qemu, "linux"),
+        ];
+        for (classify, kind) in cases {
+            let cpu = classify(&signal_output(SIGXCPU, "", ""));
+            assert_eq!(cpu.status, OracleStatus::ResourceExhausted);
+            assert_eq!(cpu.signature, format!("{kind}:rlimit:sigxcpu"));
+            let fsize = classify(&signal_output(SIGXFSZ, "", ""));
+            assert_eq!(fsize.status, OracleStatus::ResourceExhausted);
+            assert_eq!(fsize.signature, format!("{kind}:rlimit:sigxfsz"));
+            // Other signal deaths remain crashes.
+            let segv = classify(&signal_output(11, "", ""));
+            assert_eq!(segv.status, OracleStatus::Crashed);
+        }
+    }
+
+    #[test]
+    fn sigabrt_from_allocation_failure_is_resource_exhaustion() {
+        let result = classify_rust(&signal_output(
+            SIGABRT,
+            "",
+            "memory allocation of 67108864 bytes failed",
+        ));
+        assert_eq!(
+            (result.status, result.signature.as_str()),
+            (OracleStatus::ResourceExhausted, "rust:rlimit:sigabrt")
+        );
+        // SIGABRT without an allocation-failure diagnostic stays a crash.
+        let plain = classify_rust(&signal_output(SIGABRT, "", "aborting"));
+        assert_eq!(plain.status, OracleStatus::Crashed);
+    }
+
+    #[test]
+    fn rust_panic_classifies_identically_across_build_profiles() {
+        let panic_line = "{\"schema\":\"erofs-reader-oracle/v1\",\"phase\":\"panic\",\"status\":\"crashed\",\"error_class\":\"panic at src/map.rs:412\"}";
+        // Debug build: unwind, exit code 101.
+        let debug = classify_rust(&output(panic_line, "", 101, false));
+        // Release build: panic=abort, SIGABRT death.
+        let release = classify_rust(&signal_output(SIGABRT, panic_line, ""));
+        assert_eq!(debug.status, OracleStatus::Crashed);
+        assert_eq!(debug.signature, "rust:panic:src/map.rs:412");
+        assert_eq!(
+            (release.status, &release.signature),
+            (OracleStatus::Crashed, &debug.signature)
+        );
+    }
+
+    #[test]
+    fn rust_harness_failure_without_panic_event_stays_harness_error() {
+        let result = classify_rust(&output("", "thread 'main' panicked", 101, false));
+        assert_eq!(
+            (result.status, result.signature.as_str()),
+            (OracleStatus::HarnessError, "rust:unexpected-exit")
+        );
+    }
+
+    #[test]
+    fn rust_byte_budget_event_is_resource_exhaustion() {
+        let result = classify_rust(&output(
+            "{\"phase\":\"complete\",\"status\":\"resource_exhausted\",\"error_class\":\"byte_budget\",\"bytes_read\":1073741825}",
+            "",
+            1,
+            false,
+        ));
+        assert_eq!(
+            (result.status, result.signature.as_str()),
+            (OracleStatus::ResourceExhausted, "rust:byte_budget")
+        );
+    }
+
+    #[test]
+    fn rust_rejection_signature_includes_phase() {
+        let readdir = classify_rust(&output(
+            "{\"phase\":\"readdir\",\"status\":\"rejected\",\"error_class\":\"directory_entry\"}",
+            "",
+            1,
+            false,
+        ));
+        let lookup = classify_rust(&output(
+            "{\"phase\":\"lookup\",\"status\":\"rejected\",\"error_class\":\"directory_entry\"}",
+            "",
+            1,
+            false,
+        ));
+        assert_eq!(readdir.signature, "rust:readdir:directory_entry");
+        assert_eq!(lookup.signature, "rust:lookup:directory_entry");
+        assert_ne!(readdir.signature, lookup.signature);
     }
 }

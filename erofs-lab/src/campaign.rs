@@ -684,15 +684,17 @@ where
         };
         materialized += 1;
         let mut identities = Vec::new();
-        if oracle_runs >= recipe.spec.budget.max_oracle_runs {
-            stopped_reason = "oracle_budget".into();
-            break;
-        }
-        if recipe.spec.budget.wall_time_ms != 0 && wall_over_budget() {
-            stopped_reason = "wall_time".into();
-            break;
-        }
-        if recipe.spec.funnel != FunnelPolicy::MaterializeOnly {
+        // A materialized case is always recorded in the report below; budgets
+        // only gate oracle work, and the oracle budget never applies under
+        // MaterializeOnly.
+        let run_oracles = recipe.spec.funnel != FunnelPolicy::MaterializeOnly
+            && oracle_runs < recipe.spec.budget.max_oracle_runs
+            && !wall_over_budget();
+        // Set when an oracle run was killed by campaign cancellation: such
+        // runs are never recorded or escalated, and the loop stops after the
+        // partial case report is pushed.
+        let mut cancelled = false;
+        if run_oracles {
             let paths =
                 oracle_paths.ok_or(Error::Unsupported("oracle paths required by funnel"))?;
             progress(CampaignProgress {
@@ -718,16 +720,20 @@ where
                 &control,
             )?;
             oracle_runs += 1;
-            let rust_novel = record_result(&mut novelty, &rust, &mut identities);
-            let must_escalate = recipe.spec.funnel == FunnelPolicy::All
-                || rust_novel
-                || matches!(
-                    rust.result.status,
-                    OracleStatus::Crashed
-                        | OracleStatus::TimedOut
-                        | OracleStatus::ResourceExhausted
-                )
-                || (rust.result.status == OracleStatus::Rejected && seeded_retention(&case.id));
+            // Cancelled runs are never recorded and never escalate.
+            cancelled = rust.result.status == OracleStatus::Cancelled;
+            let rust_novel = !cancelled && record_result(&mut novelty, &rust, &mut identities);
+            let must_escalate = !cancelled
+                && (recipe.spec.funnel == FunnelPolicy::All
+                    || rust_novel
+                    || matches!(
+                        rust.result.status,
+                        OracleStatus::Crashed
+                            | OracleStatus::TimedOut
+                            | OracleStatus::ResourceExhausted
+                    )
+                    || (rust.result.status == OracleStatus::Rejected
+                        && seeded_retention(&case.id)));
             if must_escalate
                 && oracle_runs < recipe.spec.budget.max_oracle_runs
                 && !wall_over_budget()
@@ -755,17 +761,19 @@ where
                     &control,
                 )?;
                 oracle_runs += 1;
-                let fsck_novel = record_result(&mut novelty, &fsck, &mut identities);
-                let disagreement = rust.result.status != fsck.result.status;
-                if (recipe.spec.funnel == FunnelPolicy::All
-                    || fsck_novel
-                    || disagreement
-                    || matches!(
-                        fsck.result.status,
-                        OracleStatus::Crashed
-                            | OracleStatus::TimedOut
-                            | OracleStatus::ResourceExhausted
-                    ))
+                cancelled = fsck.result.status == OracleStatus::Cancelled;
+                let fsck_novel = !cancelled && record_result(&mut novelty, &fsck, &mut identities);
+                let disagreement = !cancelled && rust.result.status != fsck.result.status;
+                if !cancelled
+                    && (recipe.spec.funnel == FunnelPolicy::All
+                        || fsck_novel
+                        || disagreement
+                        || matches!(
+                            fsck.result.status,
+                            OracleStatus::Crashed
+                                | OracleStatus::TimedOut
+                                | OracleStatus::ResourceExhausted
+                        ))
                     && oracle_runs < recipe.spec.budget.max_oracle_runs
                     && !wall_over_budget()
                 {
@@ -792,7 +800,11 @@ where
                         &control,
                     )?;
                     oracle_runs += 1;
-                    record_result(&mut novelty, &linux, &mut identities);
+                    if linux.result.status != OracleStatus::Cancelled {
+                        record_result(&mut novelty, &linux, &mut identities);
+                    } else {
+                        cancelled = true;
+                    }
                 }
             }
         }
@@ -819,6 +831,10 @@ where
             CampaignPhase::Complete,
             case,
         );
+        if cancelled || control.is_cancelled() {
+            stopped_reason = "cancelled".into();
+            break;
+        }
         if wall_over_budget() {
             stopped_reason = "wall_time".into();
             break;
@@ -1295,12 +1311,19 @@ fn record_result(
     run: &PublishedRun,
     output: &mut Vec<ResultIdentity>,
 ) -> bool {
+    // A run killed by campaign cancellation is operator-driven, not an oracle
+    // verdict: it leaves no trace in the novelty index or the case report.
+    if run.result.status == OracleStatus::Cancelled {
+        return false;
+    }
     let identity = result_identity(run);
     let novel = novelty.results.insert(identity.clone());
     output.push(identity);
     novel
 }
 
+/// Rust signatures are `rust:<phase>:<error_class>` so distinct phases of
+/// the same error class do not collapse into one novelty entry.
 fn result_identity(run: &PublishedRun) -> ResultIdentity {
     ResultIdentity {
         profile: run
@@ -1325,6 +1348,7 @@ fn status_name(status: OracleStatus) -> &'static str {
         OracleStatus::ResourceExhausted => "resource_exhausted",
         OracleStatus::Unsupported => "unsupported",
         OracleStatus::HarnessError => "harness_error",
+        OracleStatus::Cancelled => "cancelled",
     }
 }
 
@@ -1758,5 +1782,99 @@ mod tests {
         assert!(merged.byte_sha256.contains("disk-only"));
         assert!(merged.byte_sha256.contains("memory-only"));
         let _ = fs::remove_file(&path);
+    }
+
+    fn published_run(status: OracleStatus, phase: &str, signature: &str) -> PublishedRun {
+        let phase = match phase {
+            "readdir" => crate::oracle::OraclePhase::Readdir,
+            "lookup" => crate::oracle::OraclePhase::Lookup,
+            _ => crate::oracle::OraclePhase::Unknown,
+        };
+        PublishedRun {
+            record: PathBuf::new(),
+            stdout: PathBuf::new(),
+            stderr: PathBuf::new(),
+            result: crate::oracle::OracleResult {
+                status,
+                phase,
+                signature: signature.into(),
+                classifier: "test".into(),
+                matched_rule: None,
+            },
+        }
+    }
+
+    #[test]
+    fn cancelled_oracle_run_leaves_novelty_untouched() {
+        let mut novelty = NoveltyIndex {
+            schema: NOVELTY_SCHEMA.into(),
+            ..NoveltyIndex::default()
+        };
+        let run = published_run(OracleStatus::Cancelled, "unknown", "rust:cancelled");
+        let mut identities = Vec::new();
+        assert!(!record_result(&mut novelty, &run, &mut identities));
+        assert!(novelty.results.is_empty());
+        assert!(identities.is_empty());
+    }
+
+    #[test]
+    fn rust_identity_distinguishes_events_differing_only_in_phase() {
+        let readdir = published_run(
+            OracleStatus::Rejected,
+            "readdir",
+            "rust:readdir:directory_entry",
+        );
+        let lookup = published_run(
+            OracleStatus::Rejected,
+            "lookup",
+            "rust:lookup:directory_entry",
+        );
+        assert_ne!(result_identity(&readdir), result_identity(&lookup));
+    }
+
+    #[test]
+    fn materialize_only_campaign_ignores_oracle_budget_and_records_every_sample() {
+        let root = std::env::temp_dir().join(format!(
+            "erofs-lab-campaign-test-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let parent_path = root.join("parent.erofs");
+        fs::write(&parent_path, image()).unwrap();
+        let mut specification = spec(13);
+        specification.budget.max_samples = 4;
+        specification.budget.max_oracle_runs = 0;
+        specification.budget.wall_time_ms = 0;
+        let published = run_campaign(
+            &parent_path,
+            &root.join("corpus"),
+            specification,
+            None,
+            ResourceLimits::default(),
+        )
+        .unwrap();
+        let report = &published.result;
+        assert_eq!(report.stopped_reason, "completed");
+        assert_eq!(report.samples_materialized, "4");
+        assert_eq!(report.oracle_runs, "0");
+        assert_eq!(report.cases.len(), 4);
+        assert!(
+            report
+                .cases
+                .iter()
+                .all(|case| case.sample_sha256.is_some() && !case.duplicate_bytes)
+        );
+        let distinct: BTreeSet<_> = report
+            .cases
+            .iter()
+            .filter_map(|case| case.sample_sha256.clone())
+            .collect();
+        assert_eq!(distinct.len(), 4);
+        let _ = fs::remove_dir_all(&root);
     }
 }

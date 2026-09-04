@@ -779,11 +779,17 @@ fn verify_existing(
 ) -> Result<PublishedSample, Error> {
     let image = directory.join("image.erofs");
     let manifest_path = directory.join("sample.json");
-    if sha256(&fs::read(&image)?) != manifest.output.sha256 {
-        return Err(Error::CorpusCorruption);
-    }
-    let existing: SampleManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
-    if canonical_manifest(&existing)? != canonical_manifest(manifest)? {
+    // The corpus is content-addressed: the directory name is the output
+    // sha256, so image bytes matching that hash make the entry valid no
+    // matter which plan or policy produced them — distinct plans (a no-op
+    // SetValue collapsing to zero patches, preserve vs recalculate with an
+    // unchanged CRC) can legitimately yield byte-identical output. The
+    // stored manifest stays the audit record of the first producer.
+    let name = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(Error::InvalidInput)?;
+    if sha256(&fs::read(&image)?) != name {
         return Err(Error::CorpusCorruption);
     }
     Ok(PublishedSample {
@@ -1303,6 +1309,57 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn identical_output_from_different_plans_is_not_corruption() {
+        let root =
+            std::env::temp_dir().join(format!("erofs-lab-dedup-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let parent_path = root.join("parent.erofs");
+        let parent = image();
+        fs::write(&parent_path, &parent).unwrap();
+        // Both plans produce byte-identical output (the unchanged parent)
+        // but differ in resolution mode and therefore in plan hash.
+        let raw = plan(&parent, &[], MutationMode::Raw, IntegrityPolicy::Preserve).unwrap();
+        let corrupt = plan(
+            &parent,
+            &[],
+            MutationMode::Corrupt,
+            IntegrityPolicy::Preserve,
+        )
+        .unwrap();
+        assert_ne!(raw.plan_sha256, corrupt.plan_sha256);
+        let corpus = root.join("corpus");
+        let first = materialize(&parent_path, &corpus, &raw).unwrap();
+        let second = materialize(&parent_path, &corpus, &corrupt).unwrap();
+        assert_eq!(first.image, second.image);
+        // The first producer's manifest stays the audit record.
+        let stored: SampleManifest =
+            serde_json::from_slice(&fs::read(second.manifest).unwrap()).unwrap();
+        assert_eq!(stored.plan_sha256, raw.plan_sha256);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tampered_existing_image_is_corpus_corruption() {
+        let root =
+            std::env::temp_dir().join(format!("erofs-lab-tamper-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let parent_path = root.join("parent.erofs");
+        let parent = image();
+        fs::write(&parent_path, &parent).unwrap();
+        let plan = plan(&parent, &[], MutationMode::Raw, IntegrityPolicy::Preserve).unwrap();
+        let corpus = root.join("corpus");
+        let first = materialize(&parent_path, &corpus, &plan).unwrap();
+        fs::set_permissions(&first.image, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&first.image, b"tampered").unwrap();
+        assert!(matches!(
+            materialize(&parent_path, &corpus, &plan),
+            Err(Error::CorpusCorruption)
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
     #[test]
     fn materializer_rejects_symlink_parent() {
         use std::os::unix::fs::symlink;
