@@ -8,6 +8,7 @@ mod dump;
 mod field;
 mod inject;
 mod inspect;
+mod mkfs;
 mod oracle;
 mod replay;
 
@@ -18,6 +19,7 @@ enum Commands {
     Field(field::FieldArgs),
     Inject(inject::InjectArgs),
     Inspect(inspect::InspectArgs),
+    Mkfs(mkfs::MkfsArgs),
     Convert(convert::ConvertArgs),
     Oracle(oracle::OracleArgs),
     Replay(replay::ReplayArgs),
@@ -48,6 +50,7 @@ async fn main() -> Result<()> {
         Commands::Field(args) => field::field(args),
         Commands::Inject(args) => inject::inject(args),
         Commands::Inspect(args) => inspect::inspect(args).await,
+        Commands::Mkfs(args) => mkfs::mkfs(args),
         Commands::Convert(args) => convert::convert(args),
         Commands::Oracle(args) => oracle::oracle(args),
         Commands::Replay(args) => replay::replay_sample(args),

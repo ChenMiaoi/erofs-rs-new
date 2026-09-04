@@ -247,6 +247,23 @@ impl Inode {
         }
     }
 
+    /// Returns the hard link count, decoding the compact-inode
+    /// `EROFS_I_NLINK_1_BIT` convention (non-directories with the bit set
+    /// carry an implied link count of 1).
+    pub fn nlink(&self) -> u32 {
+        const NLINK_1_BIT: u16 = 1 << 4;
+        match self {
+            Self::Compact((_, n)) => {
+                if n.format & NLINK_1_BIT != 0 && !FileType::from_raw_mode(n.mode as _).is_dir() {
+                    1
+                } else {
+                    u32::from(n.nlink)
+                }
+            }
+            Self::Extended((_, n)) => n.nlink,
+        }
+    }
+
     pub fn uid(&self) -> u32 {
         match self {
             Self::Compact((_, n)) => n.uid as u32,

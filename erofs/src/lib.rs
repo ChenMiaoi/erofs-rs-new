@@ -8,6 +8,8 @@
 //! - **Zero-copy parsing**: Via memory maps or borrowed byte slices
 //! - **Multiple backends**: Memory-mapped files, byte slices, and optional OpenDAL
 //! - **Multiple layouts**: Flat plain, flat inline, and chunk-based data layouts
+//! - **Image building**: Pack a host directory tree into an uncompressed EROFS
+//!   image with the `builder` module
 //! # Examples
 //!
 //! ## Standard usage (with std)
@@ -30,6 +32,7 @@
 //! companion `erofs-format` crate. This high-level reader intentionally uses
 //! the standard library for filesystem-facing APIs.
 
+pub mod builder;
 pub(crate) mod dirent;
 pub(crate) mod filesystem;
 

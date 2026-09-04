@@ -5,6 +5,7 @@ A pure Rust reader and inspection toolkit for [EROFS](https://docs.kernel.org/fi
 ## Features
 
 - `no_std` EROFS format primitives with checked image offsets
+- Image creation from a host directory tree (uncompressed flat layouts)
 - Synchronous and asynchronous filesystem readers
 - mmap, borrowed-slice, and optional OpenDAL backends
 - Directory traversal and file reads for supported layouts
@@ -14,7 +15,7 @@ A pure Rust reader and inspection toolkit for [EROFS](https://docs.kernel.org/fi
 ## Repository layout
 
 - `erofs-format`: `no_std` on-disk decoding, schema metadata, and the field locator.
-- `erofs`: the standard-library filesystem reader.
+- `erofs`: the standard-library filesystem reader and image builder.
 - `erofs-lab`: deterministic mutation, corpus, oracle, and minimization library.
 - `erofs-cli`: inspection, conversion, mutation, replay, oracle, and campaign commands.
 - `scripts/` and `Makefile`: the pinned Linux/QEMU workflow used for boot and fuzzing.
@@ -80,14 +81,19 @@ erofs-rs = { version = "0.2.1", features = ["opendal"] }
 ## CLI
 
 Build the CLI with `cargo build -p erofs-cli`. The available top-level
-commands are `dump`, `inspect`, `convert`, `field`, `inject`, `replay`,
-`oracle`, and `campaign`. Each command provides detailed help with `--help`.
+commands are `dump`, `inspect`, `convert`, `field`, `inject`, `mkfs`,
+`replay`, `oracle`, and `campaign`. Each command provides detailed help with
+`--help`.
 
 ```bash
 # Inspect a local image.
 erofs-cli dump image.erofs
 erofs-cli inspect -i image.erofs ls /
 erofs-cli inspect -i image.erofs cat /etc/os-release
+
+# Create an image from a host directory (flat plain layout, no compression).
+erofs-cli mkfs rootfs-dir --output image.erofs --volume-name rootfs \
+  --fixed-time 1700000000
 
 # Convert a supported image tree to tar.
 erofs-cli convert image.erofs --output out.tar
@@ -193,7 +199,23 @@ Known limitations:
 - Compressed file data is not decoded by the high-level reader.
 - Chunk-based layouts using chunk indexes are not supported.
 - Extended-attribute data access is not exposed by the high-level reader.
-- Image creation is provided by the pinned `mkfs.erofs` workflow, not a Rust API.
+
+Implemented in the image builder (`erofs::builder::ImageBuilder` and
+`erofs-cli mkfs`):
+
+- Regular files, directories, and symlinks from a host directory tree
+- Flat plain layout with whole-block allocation and extended inodes
+- Optional volume name, UUID, and fixed timestamps for reproducible images
+
+Builder limitations:
+
+- No compression, xattrs, chunk-based layout, or tail-packing inline data.
+- Device nodes, FIFOs, and sockets are rejected.
+- Hard links are stored as independent file copies.
+- The host tree must be readable on a unix system; the image is assembled in
+  memory before writing.
+- The pinned `mkfs.erofs` workflow remains available for images that need
+  features outside this scope.
 
 Unsupported layouts are rejected rather than partially decoded. The schema
 locator covers a broader ABI metadata surface than the high-level reader and

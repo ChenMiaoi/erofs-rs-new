@@ -39,6 +39,9 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("cannot build image: {0}")]
+    Build(String),
+
     #[cfg(feature = "opendal")]
     #[error("opendal error: {0}")]
     Opendal(#[from] opendal::Error),
