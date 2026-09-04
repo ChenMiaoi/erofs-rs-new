@@ -95,6 +95,10 @@ erofs-cli inspect -i image.erofs cat /etc/os-release
 erofs-cli mkfs rootfs-dir --output image.erofs --volume-name rootfs \
   --fixed-time 1700000000
 
+# Create a built-in demo image with varied test content and stable metadata.
+erofs-cli mkfs hello
+erofs-cli view hello.erofs
+
 # Convert a supported image tree to tar.
 erofs-cli convert image.erofs --output out.tar
 
