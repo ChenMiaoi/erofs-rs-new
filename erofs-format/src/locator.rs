@@ -11,6 +11,7 @@ const FEATURE_INCOMPAT_48BIT: u32 = 0x0000_0080;
 const FEATURE_INCOMPAT_DEVICE_TABLE: u32 = 0x0000_0008;
 const FEATURE_INCOMPAT_XATTR_PREFIXES: u32 = 0x0000_0040;
 const FEATURE_INCOMPAT_METABOX: u32 = 0x0000_0100;
+const FEATURE_COMPAT_PLAIN_XATTR_PFX: u32 = 0x0000_0010;
 const INODE_EXTENDED_BIT: u16 = 0x0001;
 const INODE_LAYOUT_MASK: u16 = 0x000e;
 const INODE_LAYOUT_SHIFT: u32 = 1;
@@ -417,17 +418,27 @@ impl<'a, R: ReadAt> Locator<'a, R> {
         space: MetadataSpace,
         nid: u64,
     ) -> Result<LocatedObject, LocateError<R::Error>> {
-        let offset = match space {
-            MetadataSpace::Primary => {
+        let object = ObjectRef::Inode { space, nid };
+        let (offset, metabox) = match space {
+            MetadataSpace::Primary => (
                 primary_inode_offset(self.superblock.meta_blkaddr, self.superblock.blkszbits, nid)
-                    .map_err(|_| LocateError::Overflow)?
-            }
+                    .map_err(|_| LocateError::Overflow)?,
+                None,
+            ),
             MetadataSpace::Metabox => {
-                if self.superblock.feature_incompat & FEATURE_INCOMPAT_METABOX == 0 {
-                    return Err(LocateError::UnsupportedCapability(Capability::Metabox));
+                // nid << islotbits is a logical offset inside the metabox
+                // inode's data mapping, not an absolute image offset.
+                let logical = nid
+                    .checked_mul(crate::INODE_SLOT_SIZE)
+                    .ok_or(LocateError::Overflow)?;
+                let (offset, mapped, metabox_nid) = self.map_metabox_offset(object, logical)?;
+                if mapped < COMPACT_INODE_SIZE {
+                    return Err(LocateError::UnresolvedParent {
+                        object,
+                        reason: "metabox inode slot crosses a metabox mapping boundary",
+                    });
                 }
-                nid.checked_mul(crate::INODE_SLOT_SIZE)
-                    .ok_or(LocateError::Overflow)?
+                (offset, Some((mapped, metabox_nid)))
             }
         };
         let format_span = Span::new(offset, 2).map_err(|_| LocateError::Overflow)?;
@@ -444,16 +455,129 @@ impl<'a, R: ReadAt> Locator<'a, R> {
         } else {
             (StructureId::ExtendedInode, EXTENDED_INODE_SIZE)
         };
+        if let Some((mapped, _)) = metabox
+            && mapped < size
+        {
+            return Err(LocateError::UnresolvedParent {
+                object,
+                reason: "metabox inode slot crosses a metabox mapping boundary",
+            });
+        }
         ensure_span::<R::Error>(
             Span::new(offset, size).map_err(|_| LocateError::Overflow)?,
             self.image.len(),
         )?;
-        Ok((
-            offset,
-            structure,
-            self.inode_provenance(format_span, format, nid),
-            None,
-        ))
+        let mut provenance = self.inode_provenance(format_span, format, nid);
+        if let Some((_, metabox_nid)) = metabox {
+            provenance[4] = Some(DependencyRead {
+                field: "erofs.superblock.metabox_nid",
+                span: Span {
+                    offset: SUPERBLOCK_OFFSET + 128,
+                    len: 8,
+                },
+                value: metabox_nid,
+            });
+        }
+        Ok((offset, structure, provenance, None))
+    }
+
+    /// Maps a logical offset inside the metabox inode's data to an absolute
+    /// image offset, also returning the contiguous mapped length there and
+    /// the metabox nid read from the superblock.
+    fn map_metabox_offset(
+        &self,
+        object: ObjectRef,
+        logical: u64,
+    ) -> Result<(u64, u64, u64), LocateError<R::Error>> {
+        if self.superblock.feature_incompat & FEATURE_INCOMPAT_METABOX == 0 {
+            return Err(LocateError::UnsupportedCapability(Capability::Metabox));
+        }
+        let nid_span = Span::new(SUPERBLOCK_OFFSET + 128, 8).map_err(|_| LocateError::Overflow)?;
+        ensure_span::<R::Error>(nid_span, self.image.len())?;
+        let metabox_nid = self.read_u64(nid_span.offset)?;
+        let base = primary_inode_offset(
+            self.superblock.meta_blkaddr,
+            self.superblock.blkszbits,
+            metabox_nid,
+        )
+        .map_err(|_| LocateError::Overflow)?;
+        ensure_span::<R::Error>(
+            Span::new(base, 2).map_err(|_| LocateError::Overflow)?,
+            self.image.len(),
+        )?;
+        let format = self.read_u16(base)?;
+        let extended = format & INODE_EXTENDED_BIT != 0;
+        let inode_size = if extended {
+            EXTENDED_INODE_SIZE
+        } else {
+            COMPACT_INODE_SIZE
+        };
+        let layout = (format & INODE_LAYOUT_MASK) >> INODE_LAYOUT_SHIFT;
+        if layout != LAYOUT_FLAT_PLAIN && layout != LAYOUT_FLAT_INLINE {
+            return Err(LocateError::UnsupportedCapability(Capability::Metabox));
+        }
+        ensure_span::<R::Error>(
+            Span::new(base, inode_size).map_err(|_| LocateError::Overflow)?,
+            self.image.len(),
+        )?;
+        let size = if extended {
+            self.read_u64(base + 8)?
+        } else {
+            u64::from(self.read_u32(base + 8)?)
+        };
+        let xattr_count = u64::from(self.read_u16(base + 2)?);
+        let xattr_size = if xattr_count == 0 {
+            0
+        } else {
+            XATTR_HEADER_SIZE + (xattr_count - 1) * 4
+        };
+        let block_size = 1_u64
+            .checked_shl(u32::from(self.superblock.blkszbits))
+            .ok_or(LocateError::Overflow)?;
+        if logical >= size {
+            return Err(LocateError::UnresolvedParent {
+                object,
+                reason: "metabox offset is outside the metabox inode size",
+            });
+        }
+        let blocks = size
+            .checked_add(block_size - 1)
+            .ok_or(LocateError::Overflow)?
+            / block_size;
+        // Per erofs_map_blocks_flatmode, a flat-inline metabox inode keeps
+        // the tail of its last block right after the inode and xattr area.
+        let packed_blocks = if layout == LAYOUT_FLAT_INLINE {
+            blocks - 1
+        } else {
+            blocks
+        };
+        let block_end = packed_blocks
+            .checked_mul(block_size)
+            .ok_or(LocateError::Overflow)?;
+        if logical < block_end {
+            let absolute = self
+                .flat_startblk(base)?
+                .checked_mul(block_size)
+                .and_then(|v| v.checked_add(logical))
+                .ok_or(LocateError::Overflow)?;
+            Ok((absolute, block_end - logical, metabox_nid))
+        } else {
+            let absolute = base
+                .checked_add(inode_size)
+                .and_then(|v| v.checked_add(xattr_size))
+                .and_then(|v| v.checked_add(logical - block_end))
+                .ok_or(LocateError::Overflow)?;
+            Ok((absolute, size - logical, metabox_nid))
+        }
+    }
+
+    /// Reads a flat inode's start block, adding startblk_hi under 48BIT.
+    fn flat_startblk(&self, inode_offset: u64) -> Result<u64, LocateError<R::Error>> {
+        let lo = u64::from(self.read_u32(inode_offset + 16)?);
+        if self.superblock.feature_incompat & FEATURE_INCOMPAT_48BIT == 0 {
+            return Ok(lo);
+        }
+        Ok(lo | (u64::from(self.read_u16(inode_offset + 6)?) << 32))
     }
 
     fn locate_extension(&self, index: u8) -> Result<LocatedObject, LocateError<R::Error>> {
@@ -686,11 +810,11 @@ impl<'a, R: ReadAt> Locator<'a, R> {
             Some(size),
         ))
     }
-
     fn locate_xattr_prefix(&self, index: u8) -> Result<LocatedObject, LocateError<R::Error>> {
+        let object = ObjectRef::XattrLongPrefix { index };
         if index >= self.superblock.xattr_prefix_count {
             return Err(LocateError::UnresolvedParent {
-                object: ObjectRef::XattrLongPrefix { index },
+                object,
                 reason: "prefix index is outside xattr_prefix_count",
             });
         }
@@ -700,23 +824,64 @@ impl<'a, R: ReadAt> Locator<'a, R> {
                 predicate: Predicate::WithXattrPrefixes,
             });
         }
+        // Unless PLAIN_XATTR_PFX is set, prefix records are read through the
+        // metabox inode mapping (erofs_xattr_prefixes_init).
+        let plain = self.superblock.feature_compat & FEATURE_COMPAT_PLAIN_XATTR_PFX != 0;
+        let metabox = !plain && self.superblock.feature_incompat & FEATURE_INCOMPAT_METABOX != 0;
+        if !plain && !metabox {
+            return Err(LocateError::UnsupportedCapability(Capability::Metabox));
+        }
+        let mut provenance = [None; 6];
         let mut pos = u64::from(self.superblock.xattr_prefix_start)
             .checked_mul(4)
             .ok_or(LocateError::Overflow)?;
+        let map = |pos: u64,
+                   provenance: &mut Provenance|
+         -> Result<(u64, Option<u64>), LocateError<R::Error>> {
+            if !metabox {
+                return Ok((pos, None));
+            }
+            let (absolute, mapped, metabox_nid) = self.map_metabox_offset(object, pos)?;
+            if mapped < 2 {
+                return Err(LocateError::UnresolvedParent {
+                    object,
+                    reason: "xattr prefix record crosses a metabox mapping boundary",
+                });
+            }
+            provenance[0] = Some(DependencyRead {
+                field: "erofs.superblock.metabox_nid",
+                span: Span {
+                    offset: SUPERBLOCK_OFFSET + 128,
+                    len: 8,
+                },
+                value: metabox_nid,
+            });
+            Ok((absolute, Some(mapped)))
+        };
         for _ in 0..index {
-            let len = metadata_length(self.read_u16(pos)?);
+            let (at, _) = map(pos, &mut provenance)?;
+            let len = metadata_length(self.read_u16(at)?);
             pos = align_up(pos.checked_add(2 + len).ok_or(LocateError::Overflow)?, 4)?;
         }
-        let len = metadata_length(self.read_u16(pos)?);
+        let (at, mapped) = map(pos, &mut provenance)?;
+        let len = metadata_length(self.read_u16(at)?);
         // A zero length word decodes to 65536 and is rejected by the > 256
         // bound, so no explicit zero-length arm is needed here.
         if len > 256 {
             return Err(LocateError::InvalidStructure {
-                object: ObjectRef::XattrLongPrefix { index },
+                object,
                 reason: "invalid long-prefix payload length",
             });
         }
-        Ok((pos, StructureId::XattrLongPrefix, [None; 6], Some(len)))
+        if let Some(mapped) = mapped
+            && 2 + len > mapped
+        {
+            return Err(LocateError::UnresolvedParent {
+                object,
+                reason: "xattr prefix record crosses a metabox mapping boundary",
+            });
+        }
+        Ok((at, StructureId::XattrLongPrefix, provenance, Some(len)))
     }
 
     fn locate_compression_config(
@@ -803,7 +968,16 @@ impl<'a, R: ReadAt> Locator<'a, R> {
         } else {
             8
         };
-        let start = align_up(map + 8, 8)?;
+        let mut start = align_up(map + 8, 8)?;
+        if unit == 32 {
+            // COMPACTED_2B: the 2-byte index region is preceded by
+            // compacted_4b_initial 4-byte entries aligning it to 32 bytes
+            // (zmap.c z_erofs_load_compact_lcluster).
+            let initial = ((32 - (start % 32)) / 4) & 7;
+            start = start
+                .checked_add(initial * 4)
+                .ok_or(LocateError::Overflow)?;
+        }
         let base = start
             .checked_add(index.checked_mul(unit).ok_or(LocateError::Overflow)?)
             .ok_or(LocateError::Overflow)?;
@@ -919,7 +1093,7 @@ impl<'a, R: ReadAt> Locator<'a, R> {
         let last_block = (size - 1) / block_size;
         let data_base = match layout {
             LAYOUT_FLAT_PLAIN => {
-                let startblk = u64::from(self.read_u32(inode_offset + 16)?);
+                let startblk = self.flat_startblk(inode_offset)?;
                 startblk
                     .checked_mul(block_size)
                     .and_then(|base| base.checked_add(block_start))
@@ -930,7 +1104,7 @@ impl<'a, R: ReadAt> Locator<'a, R> {
                 .and_then(|base| base.checked_add(xattr_size))
                 .ok_or(LocateError::Overflow)?,
             LAYOUT_FLAT_INLINE => {
-                let startblk = u64::from(self.read_u32(inode_offset + 16)?);
+                let startblk = self.flat_startblk(inode_offset)?;
                 startblk
                     .checked_mul(block_size)
                     .and_then(|base| base.checked_add(block_start))
@@ -1385,6 +1559,16 @@ mod tests {
         assert_eq!(algorithm.value, DecodedValue::Unsigned(0x10));
     }
 
+    /// Builds a flat-inline metabox inode at primary nid 4 with one full
+    /// block at startblk 2 and a 64-byte inline tail after the inode.
+    fn write_metabox_inode(image: &mut [u8; 16 * 1024]) {
+        image[1152..1160].copy_from_slice(&4_u64.to_le_bytes());
+        let metabox = 4096 + 4 * 32;
+        image[metabox..metabox + 2].copy_from_slice(&(LAYOUT_FLAT_INLINE << 1).to_le_bytes());
+        image[metabox + 8..metabox + 12].copy_from_slice(&(4096 + 64_u32).to_le_bytes());
+        image[metabox + 16..metabox + 20].copy_from_slice(&2_u32.to_le_bytes());
+    }
+
     #[test]
     fn locates_plain_long_prefix_and_metabox_inode() {
         let mut image = image();
@@ -1397,7 +1581,11 @@ mod tests {
         image[3200..3202].copy_from_slice(&3_u16.to_le_bytes());
         image[3202] = 1;
         image[3203..3205].copy_from_slice(b"ab");
-        image[64..66].copy_from_slice(&0_u16.to_le_bytes());
+        write_metabox_inode(&mut image);
+        // Block-mapped metabox slot: nid 2 -> logical 64 -> 2*4096 + 64.
+        image[8256..8258].copy_from_slice(&0_u16.to_le_bytes());
+        // Inline-tail metabox slot: nid 128 -> logical 4096 -> inode + 32.
+        image[4256..4258].copy_from_slice(&0_u16.to_le_bytes());
         let reader = SliceReader::new(&image);
         let locator = Locator::new(&reader).unwrap();
         let infix = locator
@@ -1416,7 +1604,155 @@ mod tests {
                 field_by_id("erofs.inode.compact.i_format").unwrap(),
             )
             .unwrap();
-        assert_eq!(inode.span.offset, 64);
+        assert_eq!(inode.span.offset, 8256);
+        assert_eq!(inode.provenance[4].unwrap().value, 4);
+        let tail = locator
+            .locate(
+                ObjectRef::Inode {
+                    space: MetadataSpace::Metabox,
+                    nid: 128,
+                },
+                field_by_id("erofs.inode.compact.i_format").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(tail.span.offset, 4256);
+    }
+
+    #[test]
+    fn xattr_prefix_without_plain_or_metabox_is_unsupported() {
+        let mut image = image();
+        image[1104..1108].copy_from_slice(&FEATURE_INCOMPAT_XATTR_PREFIXES.to_le_bytes());
+        image[1115] = 1;
+        image[1116..1120].copy_from_slice(&800_u32.to_le_bytes());
+        let reader = SliceReader::new(&image);
+        let locator = Locator::new(&reader).unwrap();
+        assert!(matches!(
+            locator.locate(
+                ObjectRef::XattrLongPrefix { index: 0 },
+                field_by_id("erofs.xattr.prefix.length").unwrap()
+            ),
+            Err(LocateError::UnsupportedCapability(Capability::Metabox))
+        ));
+    }
+
+    #[test]
+    fn locates_metabox_long_prefix_through_metabox_mapping() {
+        let mut image = image();
+        image[1104..1108].copy_from_slice(
+            &(FEATURE_INCOMPAT_XATTR_PREFIXES | FEATURE_INCOMPAT_METABOX).to_le_bytes(),
+        );
+        image[1115] = 1;
+        image[1116..1120].copy_from_slice(&1000_u32.to_le_bytes());
+        write_metabox_inode(&mut image);
+        // Logical prefix offset 1000*4 = 4000 maps to 2*4096 + 4000.
+        image[12192..12194].copy_from_slice(&3_u16.to_le_bytes());
+        image[12194] = 1;
+        image[12195..12197].copy_from_slice(b"ab");
+        let reader = SliceReader::new(&image);
+        let locator = Locator::new(&reader).unwrap();
+        let length = locator
+            .locate(
+                ObjectRef::XattrLongPrefix { index: 0 },
+                field_by_id("erofs.xattr.prefix.length").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(length.span.offset, 12192);
+        assert_eq!(length.value, DecodedValue::Unsigned(3));
+    }
+
+    #[test]
+    fn compacted_2b_pack_includes_initial_4b_entries() {
+        let mut image = image();
+        // xattr icount 2 puts the map header so ebase % 32 == 24.
+        let inode = 4096 + 3 * 32;
+        image[inode..inode + 2].copy_from_slice(&(LAYOUT_COMPRESSED_COMPACT << 1).to_le_bytes());
+        image[inode + 2..inode + 4].copy_from_slice(&2_u16.to_le_bytes());
+        let map = 4240;
+        image[map + 4..map + 6].copy_from_slice(&1_u16.to_le_bytes());
+        // A compact-8 pack without COMPACTED_2B stays at ebase + index*8.
+        let plain = 4096 + 7 * 32;
+        image[plain..plain + 2].copy_from_slice(&(LAYOUT_COMPRESSED_COMPACT << 1).to_le_bytes());
+        let plain_map = 4352;
+        let reader = SliceReader::new(&image);
+        let locator = Locator::new(&reader).unwrap();
+        // ebase = 4248, initial = ((32 - 4248 % 32) / 4) & 7 = 2.
+        let pack = locator
+            .locate(
+                ObjectRef::CompressionCompactPack { inode: 3, index: 1 },
+                field_by_id("erofs.compression.compact_pack.raw").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            pack.span,
+            Span {
+                offset: 4248 + 2 * 4 + 32,
+                len: 32
+            }
+        );
+        let pack = locator
+            .locate(
+                ObjectRef::CompressionCompactPack { inode: 7, index: 1 },
+                field_by_id("erofs.compression.compact_pack.raw").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            pack.span,
+            Span {
+                offset: plain_map + 8 + 8,
+                len: 8
+            }
+        );
+    }
+
+    #[test]
+    fn dirent_startblk_picks_up_48bit_hi() {
+        let mut hi_image = image();
+        hi_image[1104..1108].copy_from_slice(&FEATURE_INCOMPAT_48BIT.to_le_bytes());
+        let inode = 4096 + 3 * 32;
+        hi_image[inode..inode + 2].copy_from_slice(&0_u16.to_le_bytes());
+        hi_image[inode + 4..inode + 6].copy_from_slice(&MODE_DIRECTORY.to_le_bytes());
+        hi_image[inode + 6..inode + 8].copy_from_slice(&1_u16.to_le_bytes());
+        hi_image[inode + 8..inode + 12].copy_from_slice(&4096_u32.to_le_bytes());
+        hi_image[inode + 16..inode + 20].copy_from_slice(&2_u32.to_le_bytes());
+        let reader = SliceReader::new(&hi_image);
+        let locator = Locator::new(&reader).unwrap();
+        let high = ((1_u64 << 32) | 2) * 4096;
+        assert!(matches!(
+            locator.locate(
+                ObjectRef::Dirent {
+                    directory: 3,
+                    block: 0,
+                    index: 0,
+                },
+                field_by_id("erofs.dirent.nid").unwrap()
+            ),
+            Err(LocateError::OutOfBounds { span, .. })
+                if span == Span {
+                    offset: high,
+                    len: DIRENT_SIZE
+                }
+        ));
+        // Without 48BIT the same bytes are nlink and startblk stays 2.
+        let mut plain = image();
+        plain[inode..inode + 2].copy_from_slice(&0_u16.to_le_bytes());
+        plain[inode + 4..inode + 6].copy_from_slice(&MODE_DIRECTORY.to_le_bytes());
+        plain[inode + 6..inode + 8].copy_from_slice(&1_u16.to_le_bytes());
+        plain[inode + 8..inode + 12].copy_from_slice(&4096_u32.to_le_bytes());
+        plain[inode + 16..inode + 20].copy_from_slice(&2_u32.to_le_bytes());
+        plain[8200..8202].copy_from_slice(&12_u16.to_le_bytes());
+        let plain_reader = SliceReader::new(&plain);
+        let plain_locator = Locator::new(&plain_reader).unwrap();
+        let nid = plain_locator
+            .locate(
+                ObjectRef::Dirent {
+                    directory: 3,
+                    block: 0,
+                    index: 0,
+                },
+                field_by_id("erofs.dirent.nid").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(nid.span.offset, 8192);
     }
     #[test]
     fn locates_every_superblock_field_across_feature_views() {
