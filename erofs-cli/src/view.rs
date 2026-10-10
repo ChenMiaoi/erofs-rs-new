@@ -22,7 +22,7 @@ use crossterm::{
 };
 use erofs_format::{
     SliceReader, Span,
-    locator::{DecodedValue, Locator, MetadataSpace, ObjectRef, ParseMode},
+    locator::{DecodedValue, Locator, MetadataSpace, ObjectRef, ParseMode, SuperblockContext},
     schema::FIELDS,
 };
 use erofs_rs::backend::SliceImage;
@@ -491,305 +491,22 @@ impl ImageModel {
             .map(|locator| locator.superblock());
 
         if let Some(sb) = sb {
-            for index in 0..sb.ext_slots {
-                self.nodes[0].related.push(RelatedObject {
-                    label: format!("super extension [{index}]"),
-                    object: ObjectRef::SuperblockExtension { index },
-                });
-            }
-            for index in 0..sb.extra_devices {
-                self.nodes[0].related.push(RelatedObject {
-                    label: format!("device slot [{index}]"),
-                    object: ObjectRef::DeviceSlot { index },
-                });
-            }
-            for index in 0..sb.xattr_prefix_count {
-                self.nodes[0].related.push(RelatedObject {
-                    label: format!("xattr prefix [{index}]"),
-                    object: ObjectRef::XattrLongPrefix { index },
-                });
-            }
-            for algorithm in 0..4 {
-                let object = ObjectRef::CompressionConfig { algorithm };
-                if !locate_fields(bytes, mode, object).is_empty() {
-                    let name = ["lz4", "lzma", "deflate", "zstd"][usize::from(algorithm)];
-                    self.nodes[0].related.push(RelatedObject {
-                        label: format!("compression config · {name}"),
-                        object,
-                    });
-                }
-            }
+            attach_superblock_related(&mut self.nodes[0], bytes, mode, sb);
         }
 
         for node in self.nodes.iter_mut().skip(1) {
             let ObjectRef::Inode { nid, .. } = node.object else {
                 continue;
             };
-            if node.is_dir {
-                let blocks = node.data_size.unwrap_or(0).div_ceil(block_size);
-                for block in 0..blocks {
-                    for index in 0..(block_size / 12).min(4096) as u32 {
-                        if !add_related(
-                            node,
-                            bytes,
-                            mode,
-                            format!("dirent b{block}[{index}]"),
-                            ObjectRef::Dirent {
-                                directory: nid,
-                                block,
-                                index,
-                            },
-                        ) {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if add_related(
-                node,
-                bytes,
-                mode,
-                "xattr header".to_string(),
-                ObjectRef::XattrHeader { inode: nid },
-            ) {
-                for index in 0..256 {
-                    if !add_related(
-                        node,
-                        bytes,
-                        mode,
-                        format!("shared xattr [{index}]"),
-                        ObjectRef::SharedXattrId { inode: nid, index },
-                    ) {
-                        break;
-                    }
-                }
-                for index in 0..256 {
-                    let object = ObjectRef::InlineXattr { inode: nid, index };
-                    let fields = locate_fields(bytes, mode, object);
-                    if fields.is_empty()
-                        || (decoded_field(&fields, "erofs.xattr.entry.name_len") == Some(0)
-                            && decoded_field(&fields, "erofs.xattr.entry.value_size") == Some(0))
-                    {
-                        break;
-                    }
-                    node.related.push(RelatedObject {
-                        label: format!("inline xattr [{index}]"),
-                        object,
-                    });
-                }
-            }
+            attach_dirents(node, bytes, mode, nid, block_size);
+            attach_xattrs(node, bytes, mode, nid);
 
             match node.layout {
                 Some(Layout::ChunkBased) => {
-                    let raw = node.raw_block_addr.unwrap_or(0);
-                    let chunk_bits =
-                        u32::from((raw as u16) & erofs_format::CHUNK_FORMAT_BLKBITS_MASK)
-                            + block_size.trailing_zeros();
-                    let Some(chunk_size) = 1_u64.checked_shl(chunk_bits) else {
-                        continue;
-                    };
-                    let chunks = node.data_size.unwrap_or(0).div_ceil(chunk_size);
-                    let indexed = raw as u16 & erofs_format::CHUNK_FORMAT_INDEXES != 0;
-                    let mut mapped = 0usize;
-                    let mut external = 0usize;
-                    for index in 0..chunks.min(1_000_000) {
-                        let object = ObjectRef::Chunk { inode: nid, index };
-                        let fields = locate_fields(bytes, mode, object);
-                        if fields.is_empty() {
-                            break;
-                        }
-                        node.related.push(RelatedObject {
-                            label: format!("chunk [{index}]"),
-                            object,
-                        });
-                        let device = decoded_field(&fields, "erofs.chunk.device_id").unwrap_or(0);
-                        let block = if indexed {
-                            decoded_field(&fields, "erofs.chunk.startblk_lo").map(|low| {
-                                low | (decoded_field(&fields, "erofs.chunk.startblk_hi")
-                                    .unwrap_or(0)
-                                    << 32)
-                            })
-                        } else {
-                            decoded_field(&fields, "erofs.chunk.block")
-                        };
-                        if device != 0 {
-                            external += 1;
-                        } else if let Some(block) = block
-                            && block > 0
-                            && block != u64::from(u32::MAX)
-                        {
-                            let len = chunk_size.min(
-                                node.data_size
-                                    .unwrap_or(0)
-                                    .saturating_sub(index * chunk_size),
-                            );
-                            if let Ok(span) = Span::new(block.saturating_mul(block_size), len) {
-                                node.extents.push(PhysicalExtent {
-                                    role: ExtentRole::Data,
-                                    span,
-                                    logical_offset: Some(index * chunk_size),
-                                });
-                                mapped += 1;
-                            }
-                        }
-                    }
-                    node.placement_note = if external > 0 {
-                        Some(format!(
-                            "{external} chunk(s) live on external devices; {mapped} local chunk(s) mapped"
-                        ))
-                    } else if mapped == chunks as usize {
-                        None
-                    } else {
-                        Some(format!("mapped {mapped} of {chunks} chunks"))
-                    };
+                    attach_chunk_mappings(node, bytes, mode, nid, block_size);
                 }
                 Some(Layout::CompressedFull | Layout::CompressedCompact) => {
-                    let map = ObjectRef::CompressionMap { inode: nid };
-                    let fields = locate_fields(bytes, mode, map);
-                    if !fields.is_empty() {
-                        node.related.push(RelatedObject {
-                            label: "compression map".to_string(),
-                            object: map,
-                        });
-                    }
-                    let advise =
-                        decoded_field(&fields, "erofs.compression.map.advise").unwrap_or(0);
-                    if advise & 1 != 0 {
-                        let count = decoded_field(&fields, "erofs.compression.map.extents_lo")
-                            .unwrap_or(0)
-                            | (decoded_field(&fields, "erofs.compression.map.extents_hi")
-                                .unwrap_or(0)
-                                << 32);
-                        for index in 0..count.min(1_000_000) {
-                            let object = ObjectRef::CompressionExtent { inode: nid, index };
-                            let extent_fields = locate_fields(bytes, mode, object);
-                            if extent_fields.is_empty() {
-                                break;
-                            }
-                            node.related.push(RelatedObject {
-                                label: format!("compression extent [{index}]"),
-                                object,
-                            });
-                            let plen =
-                                decoded_field(&extent_fields, "erofs.compression.extent.plen")
-                                    .unwrap_or(0)
-                                    & 0x1f_ffff;
-                            let physical =
-                                decoded_field(&extent_fields, "erofs.compression.extent.pstart_lo")
-                                    .unwrap_or(0)
-                                    | (decoded_field(
-                                        &extent_fields,
-                                        "erofs.compression.extent.pstart_hi",
-                                    )
-                                    .unwrap_or(0)
-                                        << 32);
-                            let logical =
-                                decoded_field(&extent_fields, "erofs.compression.extent.lstart_lo")
-                                    .unwrap_or(0)
-                                    | (decoded_field(
-                                        &extent_fields,
-                                        "erofs.compression.extent.lstart_hi",
-                                    )
-                                    .unwrap_or(0)
-                                        << 32);
-                            if plen > 0
-                                && let Ok(span) = Span::new(physical, plen)
-                            {
-                                node.extents.push(PhysicalExtent {
-                                    role: ExtentRole::Data,
-                                    span,
-                                    logical_offset: Some(logical),
-                                });
-                            }
-                        }
-                        node.placement_note = None;
-                    } else if node.layout == Some(Layout::CompressedFull) {
-                        let cluster_bits =
-                            decoded_field(&fields, "erofs.compression.map.clusterbits")
-                                .unwrap_or(0)
-                                & 0x0f;
-                        let cluster_size = block_size.checked_shl(cluster_bits as u32).unwrap_or(0);
-                        let count = node.data_size.unwrap_or(0).div_ceil(cluster_size.max(1));
-                        let mut mapped_heads = 0usize;
-                        for index in 0..count.min(1_000_000) {
-                            let object = ObjectRef::CompressionIndex { inode: nid, index };
-                            let index_fields = locate_fields(bytes, mode, object);
-                            if index_fields.is_empty() {
-                                break;
-                            }
-                            node.related.push(RelatedObject {
-                                label: format!("lcluster [{index}]"),
-                                object,
-                            });
-                            let kind =
-                                decoded_field(&index_fields, "erofs.compression.index.advise")
-                                    .unwrap_or(2)
-                                    & 3;
-                            if advise & 0x28 == 0
-                                && kind != 2
-                                && let Some(block) =
-                                    decoded_field(&index_fields, "erofs.compression.index.blkaddr")
-                            {
-                                let next_fields = locate_fields(
-                                    bytes,
-                                    mode,
-                                    ObjectRef::CompressionIndex {
-                                        inode: nid,
-                                        index: index + 1,
-                                    },
-                                );
-                                let next_advise =
-                                    decoded_field(&next_fields, "erofs.compression.index.advise")
-                                        .unwrap_or(0);
-                                let blocks = if next_advise & 3 == 2 && next_advise & (1 << 11) != 0
-                                {
-                                    decoded_field(
-                                        &next_fields,
-                                        "erofs.compression.index.clusterofs",
-                                    )
-                                    .unwrap_or(1)
-                                    .max(1)
-                                } else {
-                                    1
-                                };
-                                if let Ok(span) = Span::new(
-                                    block.saturating_mul(block_size),
-                                    blocks.saturating_mul(block_size),
-                                ) {
-                                    node.extents.push(PhysicalExtent {
-                                        role: ExtentRole::Data,
-                                        span,
-                                        logical_offset: Some(index * cluster_size),
-                                    });
-                                    mapped_heads += 1;
-                                }
-                            }
-                        }
-                        if advise & 0x20 != 0 {
-                            node.placement_note = Some(
-                                "fragment-backed compressed payload is stored in the packed inode"
-                                    .to_string(),
-                            );
-                        } else if advise & 0x08 != 0 {
-                            node.placement_note = Some(
-                                "inline compressed pcluster mapping is not exposed".to_string(),
-                            );
-                        } else if mapped_heads > 0 {
-                            node.placement_note = None;
-                        }
-                    } else {
-                        add_related(
-                            node,
-                            bytes,
-                            mode,
-                            "compact lcluster pack [0]".to_string(),
-                            ObjectRef::CompressionCompactPack {
-                                inode: nid,
-                                index: 0,
-                            },
-                        );
-                    }
+                    attach_compressed_mappings(node, bytes, mode, nid, block_size);
                 }
                 _ => {}
             }
@@ -873,6 +590,336 @@ fn add_related(
         node.related.push(RelatedObject { label, object });
         true
     }
+}
+
+/// Appends the superblock-owned structures and per-algorithm compression configs.
+fn attach_superblock_related(
+    node: &mut Node,
+    bytes: &[u8],
+    mode: ParseMode,
+    sb: SuperblockContext,
+) {
+    for index in 0..sb.ext_slots {
+        node.related.push(RelatedObject {
+            label: format!("super extension [{index}]"),
+            object: ObjectRef::SuperblockExtension { index },
+        });
+    }
+    for index in 0..sb.extra_devices {
+        node.related.push(RelatedObject {
+            label: format!("device slot [{index}]"),
+            object: ObjectRef::DeviceSlot { index },
+        });
+    }
+    for index in 0..sb.xattr_prefix_count {
+        node.related.push(RelatedObject {
+            label: format!("xattr prefix [{index}]"),
+            object: ObjectRef::XattrLongPrefix { index },
+        });
+    }
+    for algorithm in 0..4 {
+        let object = ObjectRef::CompressionConfig { algorithm };
+        if !locate_fields(bytes, mode, object).is_empty() {
+            let name = ["lz4", "lzma", "deflate", "zstd"][usize::from(algorithm)];
+            node.related.push(RelatedObject {
+                label: format!("compression config · {name}"),
+                object,
+            });
+        }
+    }
+}
+
+/// Appends one related object per located directory-entry slot of a directory inode.
+fn attach_dirents(node: &mut Node, bytes: &[u8], mode: ParseMode, nid: u64, block_size: u64) {
+    if !node.is_dir {
+        return;
+    }
+    let blocks = node.data_size.unwrap_or(0).div_ceil(block_size);
+    for block in 0..blocks {
+        for index in 0..(block_size / 12).min(4096) as u32 {
+            let label = format!("dirent b{block}[{index}]");
+            let object = ObjectRef::Dirent {
+                directory: nid,
+                block,
+                index,
+            };
+            if !add_related(node, bytes, mode, label, object) {
+                break;
+            }
+        }
+    }
+}
+
+/// Appends the xattr header, shared xattr ids, and inline xattr entries of an inode.
+fn attach_xattrs(node: &mut Node, bytes: &[u8], mode: ParseMode, nid: u64) {
+    if !add_related(
+        node,
+        bytes,
+        mode,
+        "xattr header".to_string(),
+        ObjectRef::XattrHeader { inode: nid },
+    ) {
+        return;
+    }
+    for index in 0..256 {
+        let label = format!("shared xattr [{index}]");
+        let object = ObjectRef::SharedXattrId { inode: nid, index };
+        if !add_related(node, bytes, mode, label, object) {
+            break;
+        }
+    }
+    for index in 0..256 {
+        let object = ObjectRef::InlineXattr { inode: nid, index };
+        let fields = locate_fields(bytes, mode, object);
+        let empty_entry = decoded_field(&fields, "erofs.xattr.entry.name_len") == Some(0)
+            && decoded_field(&fields, "erofs.xattr.entry.value_size") == Some(0);
+        if fields.is_empty() || empty_entry {
+            break;
+        }
+        node.related.push(RelatedObject {
+            label: format!("inline xattr [{index}]"),
+            object,
+        });
+    }
+}
+
+/// Appends the chunk mappings of a chunk-based inode and summarizes their placement.
+fn attach_chunk_mappings(
+    node: &mut Node,
+    bytes: &[u8],
+    mode: ParseMode,
+    nid: u64,
+    block_size: u64,
+) {
+    let raw = node.raw_block_addr.unwrap_or(0);
+    let chunk_bits = u32::from((raw as u16) & erofs_format::CHUNK_FORMAT_BLKBITS_MASK)
+        + block_size.trailing_zeros();
+    let Some(chunk_size) = 1_u64.checked_shl(chunk_bits) else {
+        return;
+    };
+    let data_size = node.data_size.unwrap_or(0);
+    let chunks = data_size.div_ceil(chunk_size);
+    let indexed = raw as u16 & erofs_format::CHUNK_FORMAT_INDEXES != 0;
+    let mut mapped = 0usize;
+    let mut external = 0usize;
+    for index in 0..chunks.min(1_000_000) {
+        let object = ObjectRef::Chunk { inode: nid, index };
+        let fields = locate_fields(bytes, mode, object);
+        if fields.is_empty() {
+            break;
+        }
+        node.related.push(RelatedObject {
+            label: format!("chunk [{index}]"),
+            object,
+        });
+        let device = decoded_field(&fields, "erofs.chunk.device_id").unwrap_or(0);
+        if device != 0 {
+            external += 1;
+            continue;
+        }
+        if let Some(extent) =
+            chunk_extent(&fields, indexed, index, chunk_size, data_size, block_size)
+        {
+            node.extents.push(extent);
+            mapped += 1;
+        }
+    }
+    node.placement_note = if external > 0 {
+        Some(format!(
+            "{external} chunk(s) live on external devices; {mapped} local chunk(s) mapped"
+        ))
+    } else if mapped == chunks as usize {
+        None
+    } else {
+        Some(format!("mapped {mapped} of {chunks} chunks"))
+    };
+}
+
+/// Physical extent backing one locally stored chunk, if its block address is usable.
+fn chunk_extent(
+    fields: &[FieldRow],
+    indexed: bool,
+    index: u64,
+    chunk_size: u64,
+    data_size: u64,
+    block_size: u64,
+) -> Option<PhysicalExtent> {
+    let block = if indexed {
+        decoded_field(fields, "erofs.chunk.startblk_lo")
+            .map(|low| low | (decoded_field(fields, "erofs.chunk.startblk_hi").unwrap_or(0) << 32))
+    } else {
+        decoded_field(fields, "erofs.chunk.block")
+    }?;
+    if block == 0 || block == u64::from(u32::MAX) {
+        return None;
+    }
+    let len = chunk_size.min(data_size.saturating_sub(index * chunk_size));
+    let span = Span::new(block.saturating_mul(block_size), len).ok()?;
+    Some(PhysicalExtent {
+        role: ExtentRole::Data,
+        span,
+        logical_offset: Some(index * chunk_size),
+    })
+}
+
+/// Appends the compressed-layout mappings of an inode and summarizes their placement.
+fn attach_compressed_mappings(
+    node: &mut Node,
+    bytes: &[u8],
+    mode: ParseMode,
+    nid: u64,
+    block_size: u64,
+) {
+    let map = ObjectRef::CompressionMap { inode: nid };
+    let fields = locate_fields(bytes, mode, map);
+    if !fields.is_empty() {
+        node.related.push(RelatedObject {
+            label: "compression map".to_string(),
+            object: map,
+        });
+    }
+    let advise = decoded_field(&fields, "erofs.compression.map.advise").unwrap_or(0);
+    if advise & 1 != 0 {
+        attach_compression_extents(node, bytes, mode, nid, &fields);
+    } else if node.layout == Some(Layout::CompressedFull) {
+        let cluster_bits =
+            decoded_field(&fields, "erofs.compression.map.clusterbits").unwrap_or(0) & 0x0f;
+        let cluster_size = block_size.checked_shl(cluster_bits as u32).unwrap_or(0);
+        attach_compression_index(node, bytes, mode, nid, cluster_size, block_size, advise);
+    } else {
+        let label = "compact lcluster pack [0]".to_string();
+        let object = ObjectRef::CompressionCompactPack {
+            inode: nid,
+            index: 0,
+        };
+        add_related(node, bytes, mode, label, object);
+    }
+}
+
+/// Appends every fixed compressed extent record of an inode.
+fn attach_compression_extents(
+    node: &mut Node,
+    bytes: &[u8],
+    mode: ParseMode,
+    nid: u64,
+    map_fields: &[FieldRow],
+) {
+    let count = decoded_field(map_fields, "erofs.compression.map.extents_lo").unwrap_or(0)
+        | (decoded_field(map_fields, "erofs.compression.map.extents_hi").unwrap_or(0) << 32);
+    for index in 0..count.min(1_000_000) {
+        let object = ObjectRef::CompressionExtent { inode: nid, index };
+        let extent_fields = locate_fields(bytes, mode, object);
+        if extent_fields.is_empty() {
+            break;
+        }
+        node.related.push(RelatedObject {
+            label: format!("compression extent [{index}]"),
+            object,
+        });
+        if let Some(extent) = compression_extent(&extent_fields) {
+            node.extents.push(extent);
+        }
+    }
+    node.placement_note = None;
+}
+
+/// Physical extent described by one fixed compression extent record.
+fn compression_extent(fields: &[FieldRow]) -> Option<PhysicalExtent> {
+    let plen = decoded_field(fields, "erofs.compression.extent.plen").unwrap_or(0) & 0x1f_ffff;
+    if plen == 0 {
+        return None;
+    }
+    let physical = decoded_field(fields, "erofs.compression.extent.pstart_lo").unwrap_or(0)
+        | (decoded_field(fields, "erofs.compression.extent.pstart_hi").unwrap_or(0) << 32);
+    let logical = decoded_field(fields, "erofs.compression.extent.lstart_lo").unwrap_or(0)
+        | (decoded_field(fields, "erofs.compression.extent.lstart_hi").unwrap_or(0) << 32);
+    let span = Span::new(physical, plen).ok()?;
+    Some(PhysicalExtent {
+        role: ExtentRole::Data,
+        span,
+        logical_offset: Some(logical),
+    })
+}
+
+/// Appends the full-compression lcluster mappings of an inode and summarizes their placement.
+fn attach_compression_index(
+    node: &mut Node,
+    bytes: &[u8],
+    mode: ParseMode,
+    nid: u64,
+    cluster_size: u64,
+    block_size: u64,
+    advise: u64,
+) {
+    let count = node.data_size.unwrap_or(0).div_ceil(cluster_size.max(1));
+    let mut mapped_heads = 0usize;
+    for index in 0..count.min(1_000_000) {
+        let object = ObjectRef::CompressionIndex { inode: nid, index };
+        let index_fields = locate_fields(bytes, mode, object);
+        if index_fields.is_empty() {
+            break;
+        }
+        node.related.push(RelatedObject {
+            label: format!("lcluster [{index}]"),
+            object,
+        });
+        if let Some(span) =
+            compression_lcluster_head(bytes, mode, nid, index, &index_fields, advise, block_size)
+        {
+            node.extents.push(PhysicalExtent {
+                role: ExtentRole::Data,
+                span,
+                logical_offset: Some(index * cluster_size),
+            });
+            mapped_heads += 1;
+        }
+    }
+    if advise & 0x20 != 0 {
+        node.placement_note =
+            Some("fragment-backed compressed payload is stored in the packed inode".to_string());
+    } else if advise & 0x08 != 0 {
+        node.placement_note = Some("inline compressed pcluster mapping is not exposed".to_string());
+    } else if mapped_heads > 0 {
+        node.placement_note = None;
+    }
+}
+
+/// Span of the physical head extent mapped by one full-compression lcluster index entry.
+fn compression_lcluster_head(
+    bytes: &[u8],
+    mode: ParseMode,
+    nid: u64,
+    index: u64,
+    index_fields: &[FieldRow],
+    advise: u64,
+    block_size: u64,
+) -> Option<Span> {
+    let kind = decoded_field(index_fields, "erofs.compression.index.advise").unwrap_or(2) & 3;
+    if advise & 0x28 != 0 || kind == 2 {
+        return None;
+    }
+    let block = decoded_field(index_fields, "erofs.compression.index.blkaddr")?;
+    let next_fields = locate_fields(
+        bytes,
+        mode,
+        ObjectRef::CompressionIndex {
+            inode: nid,
+            index: index + 1,
+        },
+    );
+    let next_advise = decoded_field(&next_fields, "erofs.compression.index.advise").unwrap_or(0);
+    let blocks = if next_advise & 3 == 2 && next_advise & (1 << 11) != 0 {
+        decoded_field(&next_fields, "erofs.compression.index.clusterofs")
+            .unwrap_or(1)
+            .max(1)
+    } else {
+        1
+    };
+    Span::new(
+        block.saturating_mul(block_size),
+        blocks.saturating_mul(block_size),
+    )
+    .ok()
 }
 
 fn parse_number(value: &str) -> std::result::Result<u64, std::num::ParseIntError> {
